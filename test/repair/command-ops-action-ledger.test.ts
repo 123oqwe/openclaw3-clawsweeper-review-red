@@ -1,0 +1,136 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { readText } from "../helpers.ts";
+
+test("command status mutations have exact attempt and outcome receipts", () => {
+  const source = readText("src/repair/update-command-status.ts");
+  const patchIndex = source.indexOf('kind: "status_comment_update"');
+  const receiptIndex = source.indexOf("recordCommandProgress(lifecycle", patchIndex);
+
+  assert.ok(patchIndex >= 0);
+  assert.ok(receiptIndex > patchIndex);
+  assert.match(source, /runCommandLifecycleMutation\(lifecycle,/);
+  assert.match(source, /kind: "ack_comment_delete"/);
+  assert.match(source, /status: "unchanged"/);
+  assert.match(source, /status: "skipped"/);
+  assert.match(source, /recordCommandLifecycleFailure/);
+  assert.match(source, /await flushCommandActionEvents\(\)/);
+});
+
+test("direct repair requeues forward a stable dispatch receipt and publish it", () => {
+  const setupAction = readText(".github/actions/setup-action-ledger/action.yml");
+  const source = readText("src/repair/requeue-job.ts");
+  const workflow = readText(".github/workflows/repair-cluster-worker.yml");
+  const dispatchIndex = source.indexOf(
+    "dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle)",
+  );
+  const receiptIndex = source.indexOf("recordCommandRequeue(requeueLifecycle", dispatchIndex);
+  const finalizeStart = workflow.indexOf("- name: Finalize repair requeue action ledger");
+  const publishStart = workflow.indexOf("- name: Publish immutable repair requeue action ledger");
+  const nextStep = workflow.indexOf("- name: Record requeued work", publishStart);
+  const executeFixStart = workflow.indexOf("- name: Execute credited fix artifact");
+  const ledgerSetupStart = workflow.indexOf("- uses: ./.github/actions/setup-action-ledger");
+  const requeueStart = workflow.indexOf("- name: Requeue source-head repair races");
+  const finalizeStep = workflow.slice(finalizeStart, publishStart);
+  const publishStep = workflow.slice(publishStart, nextStep);
+
+  assert.ok(dispatchIndex >= 0);
+  assert.ok(receiptIndex > dispatchIndex);
+  assert.match(source, /deterministicRequeueDispatchKey\(\{/);
+  assert.match(source, /authorizationSha256/);
+  assert.match(source, /depth: nextRequeueDepth/);
+  assert.match(source, /boundedNextRequeueDepth\(requeueDepth, maxRequeueDepth\)/);
+  assert.match(source, /`dispatch_key=\$\{dispatchKey\}`/);
+  assert.match(source, /`job=\$\{jobPath\}`/);
+  assert.match(source, /`requeue_depth=\$\{nextRequeueDepth\}`/);
+  assert.match(source, /operationKey: `repair-requeue:/);
+  assert.match(source, /sourceRevision: authorizationSha256/);
+  assert.match(source, /runCommandLifecycleMutation\(lifecycle,/);
+  assert.match(source, /await flushCommandActionEvents\(\)/);
+  assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
+  assert.match(workflow, /- name: Create state token/);
+  assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.match(workflow, /execute:[\s\S]*?permissions:\n\s+actions: read/);
+  assert.match(workflow, /sparse-checkout: \|\n\s+jobs/);
+  assert.doesNotMatch(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
+  assert.ok(executeFixStart < ledgerSetupStart && ledgerSetupStart < requeueStart);
+  assert.ok(finalizeStart >= 0);
+  assert.ok(publishStart > finalizeStart);
+  assert.ok(nextStep > publishStart);
+  assert.match(
+    finalizeStep,
+    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+  );
+  assert.match(
+    publishStep,
+    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+  );
+  assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
+  assertCommandPublisherUsesCanonicalRoot(publishStep);
+  assert.match(finalizeStep, /--lane repair-requeue/);
+  assert.match(publishStep, /--lane repair-requeue/);
+  assert.match(publishStep, /publish-action-event-paths/);
+  assert.doesNotMatch(publishStep, /repair:publish-main|--message/);
+  assert.match(workflow, /CLUSTER_JOB_PATH: \$\{\{ inputs\.job \}\}/);
+  assert.match(workflow, /CLUSTER_REQUEUE_DEPTH: \$\{\{ inputs\.requeue_depth \}\}/);
+  assert.match(workflow, /pnpm run repair:requeue -- "\$CLUSTER_JOB_PATH"/);
+  assert.match(workflow, /--source-job-path "\$CLUSTER_JOB_PATH"/);
+  assert.match(workflow, /--requeue-depth "\$CLUSTER_REQUEUE_DEPTH"/);
+  assert.match(workflow, /--max-requeue-depth 1/);
+});
+
+test("exact review publisher bypasses the legacy action ledger and finalizes through the fenced acknowledgement", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const publisherJob = workflow.indexOf("\n  event-review-publish:");
+  const finalizationJob = workflow.indexOf("\n  event-review-terminal-finalization:");
+  const finalizationEnd = workflow.indexOf("\n  target-fanout:", finalizationJob);
+  assert.ok(publisherJob >= 0);
+  assert.ok(finalizationJob > publisherJob);
+  assert.ok(finalizationEnd > finalizationJob);
+  const publisher = workflow.slice(publisherJob, finalizationJob);
+  const finalizer = workflow.slice(finalizationJob, finalizationEnd);
+  const acknowledgement = finalizer.indexOf("- name: Begin fenced terminal acknowledgement");
+  const statusMutation = finalizer.indexOf("- name: Update final command status once");
+
+  assert.doesNotMatch(publisher, /Mark re-review complete/);
+  assert.doesNotMatch(publisher, /Publish exact review action ledger/);
+  assert.ok(acknowledgement >= 0);
+  assert.ok(statusMutation > acknowledgement);
+  assert.match(
+    finalizer.slice(statusMutation, statusMutation + 320),
+    /if: \$\{\{ steps\.terminal-acknowledgement\.outputs\.allowed == 'true' && steps\.target-write-token\.outcome == 'success' \}\}/,
+  );
+});
+
+function assertCommandFinalizerUsesCanonicalRoot(step: string): void {
+  assert.match(
+    step,
+    /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:\?setup-action-ledger output root is required/,
+  );
+  assert.match(step, /repair:action-ledger -- finalize \\\n\s+--lane [a-z0-9-]+ \\\n/);
+  assert.match(step, /> \.artifacts\/[a-z0-9-]+-action-ledger-manifest\.json/);
+}
+
+function assertCommandPublisherUsesCanonicalRoot(step: string): void {
+  assert.match(
+    step,
+    /source_root="\$\{CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:\?setup-action-ledger output root is required\}"/,
+  );
+  assert.match(step, /manifest_file="\.artifacts\/[a-z0-9-]+-action-ledger-manifest\.json"/);
+  assert.match(step, /test -s "\$manifest_file"/);
+  assert.match(step, /repair:action-ledger -- publish/);
+  assert.match(step, /--lane [a-z0-9-]+/);
+  assert.match(step, /--manifest "\$manifest_file"/);
+  assert.match(step, /--source-root "\$source_root"/);
+  assert.match(step, /--state-root \./);
+  assert.match(
+    step,
+    /jq -e --slurpfile manifest "\$manifest_file"[\s\S]*?'\.eventPaths == \$manifest\[0\]\.event_paths'/,
+  );
+  assert.match(step, /jq -r '\.paths\[\]\?' "\$import_result_file"/);
+  assert.match(step, /if \[ ! -s "\$event_paths_file" \]; then[\s\S]*?exit 1[\s\S]*?fi/);
+  assert.doesNotMatch(step, /command_shard_found/);
+  assert.doesNotMatch(step, /\.created > 0/);
+  assert.doesNotMatch(step, /exit 0/);
+}

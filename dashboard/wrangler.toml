@@ -1,0 +1,110 @@
+name = "clawsweeper-status"
+main = "worker.ts"
+account_id = "91b59577e757131d68d55a471fe32aca"
+compatibility_date = "2026-05-11"
+workers_dev = true
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[assets]
+directory = "./public"
+
+[[r2_buckets]]
+binding = "STATE_SNAPSHOTS"
+bucket_name = "clawsweeper-state-snapshots"
+
+[[durable_objects.bindings]]
+name = "STATUS_STORE"
+class_name = "StatusStore"
+
+[[durable_objects.bindings]]
+name = "EXACT_REVIEW_QUEUE"
+class_name = "ExactReviewQueue"
+
+[[durable_objects.bindings]]
+name = "GITHUB_ETAG_CACHE"
+class_name = "GithubEtagCache"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StatusStore"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ExactReviewQueue"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["GithubEtagCache"]
+
+[[routes]]
+pattern = "clawsweeper.openclaw.ai"
+custom_domain = true
+
+[vars]
+CLAWSWEEPER_REPO = "openclaw/clawsweeper"
+CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE = "poll"
+CLAWSWEEPER_APP_CLIENT_ID = "Iv23liOECG0slfuhz093"
+CLAWSWEEPER_CRABFLEET_URL = "https://crabfleet.openclaw.ai"
+TARGET_REPOS = "openclaw/openclaw,openclaw/clawhub,openclaw/clawsweeper,openclaw/fs-safe"
+# Explicit public-only allowlist for canonical repository + issue/PR references
+# rendered in OpenClaw Bay. Repositories must be verified public before addition.
+PUBLIC_BAY_REPOS = "openclaw/openclaw,openclaw/clawhub,openclaw/clawsweeper,openclaw/fs-safe"
+APPLY_TARGET_REPOS = "openclaw/openclaw"
+APPLY_OPTIONAL_TARGET_REPOS = "openclaw/clawhub"
+CLAWSWEEPER_ENABLE_CLAWHUB = "1"
+WORKER_BUDGET = "32"
+EXACT_REVIEW_ACTIONS_BUDGET = "194"
+WORKER_DETAIL_RUN_LIMIT = "128"
+WORKER_JOB_FETCH_CONCURRENCY = "12"
+WORKER_JOB_CACHE_TTL_SECONDS = "60"
+WORKER_HEALTH_CACHE_TTL_SECONDS = "120"
+WORKER_HEALTH_FETCH_CONCURRENCY = "20"
+AUTOMERGE_CACHE_TTL_SECONDS = "300"
+RECENT_CLOSED_CACHE_TTL_SECONDS = "300"
+CACHE_TTL_SECONDS = "60"
+INCLUDE_CI_STATUS = "1"
+EXACT_REVIEW_QUEUE_MAX_CONCURRENT = "32"
+EXACT_REVIEW_TARGET_MAX_CONCURRENT = "24"
+EXACT_REVIEW_SCHEDULED_MAX_CONCURRENT = "8"
+EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT = "8"
+EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT = "32"
+EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT = "32"
+EXACT_REVIEW_DISPATCH_LEASE_MS = "360000"
+EXACT_REVIEW_EXECUTION_LEASE_MS = "7800000"
+EXACT_REVIEW_HEARTBEAT_GRACE_MS = "1200000"
+EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS = "60000"
+EXACT_REVIEW_DISPATCH_DEBOUNCE_MS = "90000"
+EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS = "180000"
+# Bump only when a scanner, policy, or deployment change should grant unchanged
+# parked review inputs a fresh bounded retry budget.
+EXACT_REVIEW_RETRY_POLICY_EPOCH = "1"
+EXACT_REVIEW_PENDING_SOFT_LIMIT = "600"
+# Bay is observer-only; 30 seconds of staleness is acceptable.
+EXACT_REVIEW_LIFECYCLE_BAY_CACHE_MS = "30000"
+# A full review consumes about 30 GitHub requests. Keep scheduled review demand
+# at or below 1,800 requests/hour so the 15,000-request installation bucket has
+# explicit capacity for exact ingress, comment routing, apply proof, publication,
+# and support lanes. A six-item burst bounds cold-start demand to roughly 180
+# requests. Interactive exact-event reviews keep their independent lane.
+EXACT_REVIEW_TARGET_RATE_PER_HOUR = "60"
+EXACT_REVIEW_TARGET_BURST = "6"
+EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED = "1"
+EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED = "1"
+EXACT_REVIEW_STATE_REPO = "openclaw/clawsweeper-state"
+EXACT_REVIEW_STATE_REF = "state"
+EXACT_REVIEW_PUBLICATION_BATCH_SIZE = "8"
+EXACT_REVIEW_PUBLICATION_BATCH_MAX_CONCURRENT = "8"
+# Reserve 2 members for recent protocol-v2 tuples that still match the
+# queue's current source revision. The other 6 members keep draining FIFO.
+EXACT_REVIEW_PUBLICATION_FRESH_LANE_ENABLED = "1"
+EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS = "2"
+EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_AGE_MS = "900000"
+EXACT_REVIEW_PUBLICATION_BATCH_WAIT_MS = "60000"
+# Refill the existing eight bounded publisher slots quickly; a 30s refill
+# serialized batches despite dozens of ready publication records.
+EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_COOLDOWN_MS = "5000"
+EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_RESERVATION_MS = "600000"
+REVIEW_OBSERVABILITY_REQUIRED = "0"
+REVIEW_RECOVERY_ENABLED = "0"

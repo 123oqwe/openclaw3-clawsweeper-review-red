@@ -1,0 +1,1900 @@
+import assert from "node:assert/strict";
+import childProcess, { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import test from "node:test";
+
+import {
+  ensurePullRequestReviewHead,
+  ensureReviewTreeCommit,
+  githubReviewBlobSizes,
+  githubReviewTreeBlobSizes,
+  hydratePullRequestReviewBlobs,
+  hydratePullRequestReviewHistory,
+  materializePullRequestReviewTree,
+  materializePullRequestReviewTreeForTest,
+  removePullRequestReviewTree,
+  REVIEW_TREE_MAX_BYTES,
+  ReviewGitError,
+} from "../dist/clawsweeper-review-blobs.js";
+import { MAX_SCAN_BYTES } from "../dist/agent-input-scan.js";
+import { createContextHydration } from "../dist/clawsweeper-context-hydration.js";
+import { createGitHubRuntime } from "../dist/clawsweeper-github-runtime.js";
+import { asRecord } from "../dist/clawsweeper-item-policy.js";
+import { createReviewRuntime } from "../dist/clawsweeper-review-runtime.js";
+import { main, reviewPolicyHashForTest } from "../dist/clawsweeper-runtime.js";
+import { runText } from "../dist/command.js";
+import { readReviewGit, reviewMergeBase } from "../dist/pr-review-evidence.js";
+import { ReviewSourcePreparationError } from "../dist/review-source-preparation.js";
+import { withMockGh } from "./helpers.ts";
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function ensureShallowPullRequestReviewHead(targetDir: string, headSha: string): boolean {
+  git(
+    targetDir,
+    "fetch",
+    "-q",
+    "--filter=blob:none",
+    "--depth=1",
+    "origin",
+    "refs/pull/982/head:refs/clawsweeper/review-cache/head-982",
+  );
+  return objectExistsOffline(targetDir, `${headSha}^{commit}`);
+}
+
+function partialCloneFixture({
+  extraFiles = 0,
+  largeFiles = [],
+  prefetchHead = true,
+  historicalBase = false,
+  attributes = false,
+}: {
+  extraFiles?: number;
+  largeFiles?: number[];
+  prefetchHead?: boolean;
+  historicalBase?: boolean;
+  attributes?: boolean;
+} = {}) {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-review-promisor-"));
+  const origin = join(root, "origin.git");
+  const source = join(root, "source");
+  const target = join(root, "target");
+  mkdirSync(source);
+  git(root, "init", "--bare", "-q", origin);
+  git(origin, "config", "uploadpack.allowFilter", "true");
+  git(source, "init", "-q", "-b", "main");
+  git(source, "config", "user.name", "ClawSweeper Review Test");
+  git(source, "config", "user.email", "review-test@example.com");
+  git(source, "config", "commit.gpgsign", "false");
+  writeFileSync(join(source, "changed.txt"), "before\n");
+  writeFileSync(join(source, "removed.txt"), "remove me\n");
+  if (historicalBase) {
+    writeFileSync(join(source, "mode.txt"), "mode only\n");
+    for (let index = 0; index < extraFiles; index++) {
+      writeFileSync(join(source, `additional-${index}.txt`), `before ${index}\n`);
+    }
+    for (const [index, bytes] of largeFiles.entries()) {
+      const data = Buffer.alloc(bytes, index + 10);
+      data[0] = 0;
+      writeFileSync(join(source, `large-${index}.bin`), data);
+    }
+  }
+  git(source, "add", ".");
+  git(source, "update-index", "--add", "--cacheinfo", `160000,${"1".repeat(40)},vendor/library`);
+  git(source, "commit", "-qm", "base");
+  const baseSha = git(source, "rev-parse", "HEAD");
+  git(source, "remote", "add", "origin", origin);
+  git(source, "push", "-q", "origin", "main");
+
+  git(source, "checkout", "-qb", "feature");
+  writeFileSync(join(source, "changed.txt"), "after\n");
+  writeFileSync(join(source, "added.txt"), "new implementation\n");
+  mkdirSync(join(source, "nested"));
+  writeFileSync(join(source, "nested", "feature[1].txt"), "nested literal\n");
+  writeFileSync(join(source, ":(glob)literal.txt"), "pathspec literal\n");
+  if (attributes) writeFileSync(join(source, ".gitattributes"), "*.txt -text\n");
+  for (let index = 0; index < extraFiles; index += 1) {
+    writeFileSync(join(source, `additional-${index}.txt`), `additional ${index}\n`);
+  }
+  for (const [index, bytes] of largeFiles.entries()) {
+    const data = Buffer.alloc(bytes, index + 1);
+    data[0] = 0;
+    writeFileSync(join(source, `large-${index}.bin`), data);
+  }
+  git(source, "rm", "-q", "removed.txt");
+  git(source, "add", ".");
+  git(source, "update-index", "--add", "--cacheinfo", `160000,${"2".repeat(40)},vendor/library`);
+  if (historicalBase) {
+    chmodSync(join(source, "mode.txt"), 0o755);
+    git(source, "update-index", "--chmod=+x", "mode.txt");
+  }
+  git(source, "commit", "-qm", "feature");
+  const headSha = git(source, "rev-parse", "HEAD");
+  const addedBlobSha = git(source, "rev-parse", "HEAD:added.txt");
+  const changedBlobSha = git(source, "rev-parse", "HEAD:changed.txt");
+  git(source, "push", "-q", "origin", "HEAD:refs/pull/982/head");
+  if (historicalBase) {
+    git(source, "checkout", "-q", "main");
+    writeFileSync(join(source, "changed.txt"), "current main\n");
+    git(source, "rm", "-q", "removed.txt");
+    for (let index = 0; index < extraFiles; index++) {
+      writeFileSync(join(source, `additional-${index}.txt`), `main ${index}\n`);
+    }
+    for (const [index] of largeFiles.entries()) {
+      writeFileSync(join(source, `large-${index}.bin`), "main binary replacement\n");
+    }
+    git(source, "add", ".");
+    git(source, "commit", "-qm", "advance main past pinned base");
+    git(source, "push", "-q", "origin", "main");
+  }
+  git(
+    root,
+    "clone",
+    "-q",
+    "--filter=blob:none",
+    "--branch",
+    "main",
+    "--single-branch",
+    `file://${origin}`,
+    target,
+  );
+  if (prefetchHead) {
+    git(
+      target,
+      "fetch",
+      "-q",
+      "--filter=blob:none",
+      "origin",
+      "refs/pull/982/head:refs/clawsweeper/review-cache/head-982",
+      "--depth=1",
+    );
+  }
+  return { root, source, target, baseSha, headSha, addedBlobSha, changedBlobSha };
+}
+
+function resolveFixtureBlobSizes(source: string) {
+  return (objectIds: readonly string[]) => {
+    const output = execFileSync("git", ["cat-file", "--batch-check=%(objectname) %(objectsize)"], {
+      cwd: source,
+      encoding: "utf8",
+      input: `${objectIds.join("\n")}\n`,
+    });
+    return new Map(
+      output
+        .trim()
+        .split("\n")
+        .map((line) => {
+          const [oid, bytes] = line.split(" ");
+          return [oid!, Number(bytes)];
+        }),
+    );
+  };
+}
+
+function objectExistsOffline(cwd: string, sha: string): boolean {
+  return (
+    spawnSync("git", ["cat-file", "-e", sha], {
+      cwd,
+      env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+      stdio: "ignore",
+    }).status === 0
+  );
+}
+
+function populateFixtureHeadBlobs(source: string, target: string, headSha: string): void {
+  const entries = git(
+    source,
+    "ls-tree",
+    "-r",
+    "--format=%(objectmode) %(objectname)",
+    headSha,
+  ).split("\n");
+  for (const entry of entries) {
+    const [mode, objectId] = entry.split(" ");
+    if (!["100644", "100755", "120000"].includes(mode ?? "") || !objectId) continue;
+    execFileSync("git", ["cat-file", "blob", objectId], {
+      cwd: target,
+      stdio: "ignore",
+    });
+  }
+}
+
+// Shallow fixtures must acquire complete ancestry without truncating history
+// already retained behind the pinned base.
+function reviewHistoryFixture({
+  commitsBeforeBranch,
+  commitsAfterBranch,
+  commitsAfterMerge = 0,
+  commitsPastBase = 0,
+  cloneDepth,
+  baseRefreshDepth = 50,
+  mergeBaseIntoFeature = false,
+  publishPullRef = true,
+}: {
+  commitsBeforeBranch: number;
+  commitsAfterBranch: number;
+  commitsAfterMerge?: number;
+  commitsPastBase?: number;
+  cloneDepth?: number;
+  baseRefreshDepth?: number | null;
+  mergeBaseIntoFeature?: boolean;
+  publishPullRef?: boolean;
+}) {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-review-history-"));
+  const origin = join(root, "origin.git");
+  const source = join(root, "source");
+  const target = join(root, "target");
+  mkdirSync(source);
+  git(root, "init", "--bare", "-q", origin);
+  git(origin, "config", "uploadpack.allowFilter", "true");
+  git(origin, "config", "uploadpack.allowAnySHA1InWant", "true");
+  git(source, "init", "-q", "-b", "main");
+  // Keep history-fixture construction from racing Git's detached maintenance.
+  git(source, "config", "maintenance.auto", "false");
+  git(source, "config", "user.name", "ClawSweeper Review Test");
+  git(source, "config", "user.email", "review-test@example.com");
+  git(source, "config", "commit.gpgsign", "false");
+  const commit = (name: string) => {
+    writeFileSync(join(source, "history.txt"), `${name}\n`);
+    git(source, "add", "-A");
+    git(source, "commit", "-qm", name);
+  };
+  commit("root");
+  for (let index = 0; index < commitsBeforeBranch; index += 1) commit(`history ${index}`);
+  const branchPoint = git(source, "rev-parse", "HEAD");
+  git(source, "checkout", "-qb", "feature");
+  writeFileSync(join(source, "feature.txt"), "feature\n");
+  git(source, "add", "-A");
+  git(source, "commit", "-qm", "feature");
+  let headSha = git(source, "rev-parse", "HEAD");
+  git(source, "checkout", "-q", "main");
+  for (let index = 0; index < commitsAfterBranch; index += 1) commit(`base ${index}`);
+  // The remote base may advance beyond the selected review tuple. Keep later
+  // commits on main to prove acquisition preserves the pinned ancestry.
+  const baseSha = git(source, "rev-parse", "HEAD");
+  for (let index = 0; index < commitsPastBase; index += 1) commit(`past base ${index}`);
+  git(source, "remote", "add", "origin", origin);
+  git(source, "push", "-q", "origin", "main");
+  if (mergeBaseIntoFeature) {
+    git(source, "checkout", "-q", "feature");
+    git(source, "merge", "-q", "--no-ff", baseSha, "-m", "merge main");
+    for (let index = 0; index < commitsAfterMerge; index += 1) {
+      writeFileSync(join(source, "feature.txt"), `after merge ${index}\n`);
+      git(source, "commit", "-qam", `after merge ${index}`);
+    }
+    headSha = git(source, "rev-parse", "HEAD");
+  }
+  if (publishPullRef) git(source, "push", "-q", "origin", "feature:refs/pull/982/head");
+
+  git(
+    root,
+    "clone",
+    "-q",
+    "--filter=blob:none",
+    "--branch",
+    "main",
+    "--single-branch",
+    ...(cloneDepth ? [`--depth=${cloneDepth}`] : []),
+    `file://${origin}`,
+    target,
+  );
+  // Explicitly shallow fixtures exercise recovery independently of metadata refresh.
+  if (baseRefreshDepth !== null) {
+    git(
+      target,
+      "fetch",
+      "-q",
+      "origin",
+      "refs/heads/main:refs/remotes/origin/main",
+      `--depth=${baseRefreshDepth}`,
+    );
+  }
+  return { root, origin, source, target, baseSha, headSha, branchPoint };
+}
+
+function reachable(target: string, sha: string): number {
+  const count = spawnSync("git", ["rev-list", "--count", sha], {
+    cwd: target,
+    encoding: "utf8",
+    env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+  });
+  return count.status === 0 ? Number(count.stdout.trim()) : -1;
+}
+
+function prepareFixtureCommits(fixture: { target: string; baseSha: string; headSha: string }) {
+  assert.ok(
+    ensureReviewTreeCommit({
+      targetDir: fixture.target,
+      sha: fixture.baseSha,
+      sourceRef: "refs/heads/main",
+      destinationRef: "refs/clawsweeper/review-cache/base-982",
+    }),
+  );
+  assert.ok(
+    ensurePullRequestReviewHead({
+      targetDir: fixture.target,
+      itemNumber: 982,
+      headSha: fixture.headSha,
+    }),
+  );
+}
+
+function reviewGitInfo(releaseTag?: string) {
+  const unavailable = (): never => {
+    throw new Error("Unexpected dependency in native Git preparation fixture");
+  };
+  return createReviewRuntime({
+    reviewItemPromptPath: "",
+    decisionSchemaPath: "",
+    prCloseCoverageProofPromptPath: "",
+    targetRepo: () => "fixture/repository",
+    run: runText,
+    ghJson: <T>() => (releaseTag ? [{ tagName: releaseTag, isLatest: true }] : []) as T,
+    evidenceEntry: unavailable,
+    untrustedCodexEnv: unavailable,
+    asRecord: unavailable,
+    defaultRootCauseCluster: unavailable,
+    parseDecision: unavailable,
+    ensureDir: unavailable,
+    stringOrUndefined: unavailable,
+  }).gitInfo;
+}
+
+for (const withRelease of [false, true]) {
+  test(`metadata refresh preserves complete review history, release=${withRelease}`, (t) => {
+    const fixture = reviewHistoryFixture({
+      commitsBeforeBranch: 60,
+      commitsAfterBranch: 10,
+      mergeBaseIntoFeature: true,
+      baseRefreshDepth: null,
+    });
+    const reviewTree = join(fixture.root, "review-tree");
+    try {
+      const releaseTag = "review-fixture-release";
+      if (withRelease) {
+        git(fixture.source, "-c", "tag.gpgsign=false", "tag", releaseTag, fixture.branchPoint);
+        git(fixture.source, "push", "-q", "origin", `refs/tags/${releaseTag}`);
+      }
+      const gitInfo = reviewGitInfo(withRelease ? releaseTag : undefined);
+      const expectedAncestors = reachable(fixture.source, fixture.baseSha);
+      assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+      const info = gitInfo(fixture.target);
+      t.diagnostic(
+        JSON.stringify({
+          stage: "metadata-refresh",
+          withRelease,
+          expectedAncestors,
+          actualAncestors: reachable(fixture.target, fixture.baseSha),
+          shallow: git(fixture.target, "rev-parse", "--is-shallow-repository"),
+        }),
+      );
+      assert.equal(info.mainSha, fixture.baseSha);
+      assert.equal(info.releaseStateComplete, true);
+      if (withRelease) assert.equal(info.latestRelease?.sha, fixture.branchPoint);
+      assert.equal(reachable(fixture.target, fixture.baseSha), expectedAncestors);
+      assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+
+      prepareFixtureCommits(fixture);
+      assert.equal(
+        hydratePullRequestReviewHistory({
+          targetDir: fixture.target,
+          baseSha: fixture.baseSha,
+          headSha: fixture.headSha,
+          itemNumber: 982,
+        }),
+        fixture.baseSha,
+      );
+      hydratePullRequestReviewBlobs({
+        targetDir: fixture.target,
+        baseSha: fixture.baseSha,
+        headSha: fixture.headSha,
+        resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+      });
+      assert.ok(
+        materializePullRequestReviewTree({
+          targetDir: fixture.target,
+          worktreeDir: reviewTree,
+          itemNumber: 982,
+          headSha: fixture.headSha,
+        }),
+      );
+
+      // Lease revalidation refreshes metadata after the pinned checkout already exists.
+      gitInfo(fixture.target);
+      assert.equal(git(reviewTree, "rev-parse", "HEAD"), fixture.headSha);
+      assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+      assert.equal(reachable(reviewTree, fixture.baseSha), expectedAncestors);
+      assert.equal(
+        reachable(reviewTree, fixture.headSha),
+        reachable(fixture.source, fixture.headSha),
+      );
+      assert.equal(
+        reviewMergeBase(reviewTree, fixture.baseSha, fixture.headSha).sha,
+        fixture.baseSha,
+      );
+      assert.equal(git(reviewTree, "status", "--porcelain"), "");
+      assert.equal(readFileSync(join(reviewTree, "feature.txt"), "utf8"), "feature\n");
+      assert.equal(git(reviewTree, "show", `${fixture.baseSha}:history.txt`), "base 9");
+    } finally {
+      removePullRequestReviewTree({ targetDir: fixture.target, worktreeDir: reviewTree });
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("review acquisition preserves a pinned base after main advances", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  try {
+    git(fixture.source, "checkout", "-q", "main");
+    writeFileSync(join(fixture.source, "main.txt"), "pinned base\n");
+    git(fixture.source, "add", "main.txt");
+    git(fixture.source, "commit", "-qm", "pinned REST base");
+    const pinnedBase = git(fixture.source, "rev-parse", "HEAD");
+    writeFileSync(join(fixture.source, "main.txt"), "new main\n");
+    git(fixture.source, "commit", "-qam", "advance main");
+    git(fixture.source, "push", "-q", "origin", "main");
+    assert.equal(objectExistsOffline(fixture.target, pinnedBase), false);
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+    assert.equal(
+      ensureReviewTreeCommit({
+        targetDir: fixture.target,
+        sha: pinnedBase,
+        sourceRef: "refs/heads/main",
+        destinationRef: "refs/clawsweeper/review-cache/base-982",
+      }),
+      true,
+    );
+    assert.equal(objectExistsOffline(fixture.target, pinnedBase), true);
+    assert.equal(reachable(fixture.target, pinnedBase), reachable(fixture.source, pinnedBase));
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+    assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+    assert.equal(git(fixture.target, "status", "--porcelain"), "");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("optional test-merge acquisition preserves prepared head ancestry", (t) => {
+  const fixture = reviewHistoryFixture({
+    commitsBeforeBranch: 5,
+    commitsAfterBranch: 5,
+    mergeBaseIntoFeature: true,
+    baseRefreshDepth: null,
+  });
+  try {
+    git(fixture.source, "checkout", "-qb", "test-merge", "main");
+    git(fixture.source, "merge", "-q", "--no-ff", fixture.headSha, "-m", "test merge");
+    const testMergeSha = git(fixture.source, "rev-parse", "HEAD");
+    git(fixture.source, "push", "-q", "origin", "HEAD:refs/pull/982/merge");
+    prepareFixtureCommits(fixture);
+    assert.equal(
+      hydratePullRequestReviewHistory({
+        targetDir: fixture.target,
+        baseSha: fixture.baseSha,
+        headSha: fixture.headSha,
+        itemNumber: 982,
+        testMergeSha,
+      }),
+      fixture.baseSha,
+    );
+    t.diagnostic(
+      JSON.stringify({
+        stage: "test-merge",
+        expectedAncestors: reachable(fixture.source, testMergeSha),
+        actualAncestors: reachable(fixture.target, testMergeSha),
+      }),
+    );
+    assert.equal(reachable(fixture.target, testMergeSha), reachable(fixture.source, testMergeSha));
+    assert.equal(
+      reachable(fixture.target, fixture.headSha),
+      reachable(fixture.source, fixture.headSha),
+    );
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+    assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+    assert.equal(git(fixture.target, "status", "--porcelain"), "");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("supplied checkout exact-review sequence recovers merged base history", () => {
+  // Keep the merge from base deep in the PR history so acquisition itself must
+  // preserve the ancestry needed to establish the pinned merge base.
+  const fixture = reviewHistoryFixture({
+    commitsBeforeBranch: 10,
+    commitsAfterBranch: 10,
+    commitsAfterMerge: 300,
+    mergeBaseIntoFeature: true,
+  });
+  try {
+    prepareFixtureCommits(fixture);
+    assert.equal(
+      hydratePullRequestReviewHistory({
+        targetDir: fixture.target,
+        baseSha: fixture.baseSha,
+        headSha: fixture.headSha,
+        itemNumber: 982,
+      }),
+      fixture.baseSha,
+    );
+    assert.equal(
+      reviewMergeBase(fixture.target, fixture.baseSha, fixture.headSha).status,
+      "verified",
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review source acquisition keeps base ancestry the checkout already had", () => {
+  // The shallow PR tip must not discard older ancestry already present behind the
+  // pinned base, even when the remote branch has advanced beyond that base.
+  const fixture = reviewHistoryFixture({
+    commitsBeforeBranch: 300,
+    commitsAfterBranch: 300,
+    commitsPastBase: 100,
+  });
+  try {
+    assert.ok(ensureShallowPullRequestReviewHead(fixture.target, fixture.headSha));
+    const before = reachable(fixture.target, fixture.baseSha);
+    assert.equal(before, reachable(fixture.source, fixture.baseSha));
+    assert.equal(
+      reviewMergeBase(fixture.target, fixture.baseSha, fixture.headSha).status,
+      "unavailable",
+    );
+
+    prepareFixtureCommits(fixture);
+    assert.equal(
+      hydratePullRequestReviewHistory({
+        targetDir: fixture.target,
+        baseSha: fixture.baseSha,
+        headSha: fixture.headSha,
+        itemNumber: 982,
+      }),
+      fixture.branchPoint,
+    );
+
+    assert.equal(
+      reviewMergeBase(fixture.target, fixture.baseSha, fixture.headSha).status,
+      "verified",
+    );
+    assert.equal(reachable(fixture.target, fixture.baseSha), before);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review source acquisition completes a genuinely shallow base and head", () => {
+  const fixture = reviewHistoryFixture({
+    commitsBeforeBranch: 10,
+    commitsAfterBranch: 20,
+    cloneDepth: 1,
+    baseRefreshDepth: 1,
+  });
+  try {
+    assert.ok(ensureShallowPullRequestReviewHead(fixture.target, fixture.headSha));
+    assert.equal(reachable(fixture.target, fixture.baseSha), 1);
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "true");
+
+    prepareFixtureCommits(fixture);
+    assert.equal(
+      hydratePullRequestReviewHistory({
+        targetDir: fixture.target,
+        baseSha: fixture.baseSha,
+        headSha: fixture.headSha,
+        itemNumber: 982,
+      }),
+      fixture.branchPoint,
+    );
+    assert.equal(
+      reviewMergeBase(fixture.target, fixture.baseSha, fixture.headSha).status,
+      "verified",
+    );
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+    assert.equal(
+      reachable(fixture.target, fixture.baseSha),
+      reachable(fixture.source, fixture.baseSha),
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review source acquisition refuses unrelated complete histories", () => {
+  const fixture = reviewHistoryFixture({
+    commitsBeforeBranch: 5,
+    commitsAfterBranch: 5,
+    baseRefreshDepth: null,
+  });
+  try {
+    const tree = git(fixture.source, "rev-parse", `${fixture.headSha}^{tree}`);
+    const headSha = git(fixture.source, "commit-tree", tree, "-m", "unrelated review history");
+    git(fixture.source, "push", "-q", "--force", "origin", `${headSha}:refs/pull/982/head`);
+    prepareFixtureCommits({ ...fixture, headSha });
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+    assert.equal(
+      hydratePullRequestReviewHistory({
+        targetDir: fixture.target,
+        baseSha: fixture.baseSha,
+        headSha,
+        itemNumber: 982,
+      }),
+      null,
+    );
+    assert.equal(reviewMergeBase(fixture.target, fixture.baseSha, headSha).status, "unavailable");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review source acquisition refuses an unreachable pull ref", () => {
+  const fixture = reviewHistoryFixture({
+    commitsBeforeBranch: 5,
+    commitsAfterBranch: 5,
+    publishPullRef: false,
+  });
+  try {
+    rmSync(join(fixture.root, "origin.git"), { recursive: true, force: true });
+    assert.throws(
+      () =>
+        ensurePullRequestReviewHead({
+          targetDir: fixture.target,
+          headSha: fixture.headSha,
+          itemNumber: 982,
+        }),
+      (error: unknown) =>
+        error instanceof ReviewGitError &&
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticStage === "source_preparation" &&
+        error.diagnosticReason === "review_commit_fetch_failed" &&
+        error.reviewedHeadSha === fixture.headSha &&
+        error.status !== null &&
+        error.status > 0,
+    );
+    assert.equal(
+      reviewMergeBase(fixture.target, fixture.baseSha, fixture.headSha).status,
+      "unavailable",
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted PR review can inspect changed blobs from a genuine blobless clone offline", () => {
+  const fixture = partialCloneFixture();
+  try {
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    assert.equal(objectExistsOffline(fixture.target, fixture.changedBlobSha), false);
+
+    const result = hydratePullRequestReviewBlobs({
+      targetDir: fixture.target,
+      baseSha: fixture.baseSha,
+      headSha: fixture.headSha,
+      resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+    });
+
+    assert.equal(result, 6);
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), true);
+    assert.equal(objectExistsOffline(fixture.target, fixture.changedBlobSha), true);
+    git(fixture.target, "remote", "set-url", "origin", "https://invalid.invalid/offline.git");
+    assert.equal(git(fixture.target, "show", `${fixture.headSha}:added.txt`), "new implementation");
+    assert.equal(git(fixture.target, "show", `${fixture.headSha}:changed.txt`), "after");
+    assert.equal(
+      git(fixture.target, "show", `${fixture.headSha}:nested/feature[1].txt`),
+      "nested literal",
+    );
+    assert.equal(
+      git(fixture.target, "show", `${fixture.headSha}::(glob)literal.txt`),
+      "pathspec literal",
+    );
+    assert.match(
+      git(fixture.target, "diff", fixture.baseSha, fixture.headSha, "--", "changed.txt"),
+      /\+after/,
+    );
+    assert.equal(git(fixture.target, "status", "--porcelain"), "");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review materializes the exact pull request head before model execution", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const reviewTree = join(fixture.root, "review-tree");
+  try {
+    assert.equal(objectExistsOffline(fixture.target, fixture.headSha), false);
+    assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+    assert.equal(readFileSync(join(fixture.target, "changed.txt"), "utf8"), "before\n");
+    populateFixtureHeadBlobs(fixture.source, fixture.target, fixture.headSha);
+
+    assert.equal(
+      materializePullRequestReviewTree({
+        targetDir: fixture.target,
+        worktreeDir: reviewTree,
+        itemNumber: 982,
+        headSha: fixture.headSha,
+        resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+      }),
+      true,
+    );
+    assert.equal(objectExistsOffline(fixture.target, fixture.headSha), true);
+    assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+    assert.equal(readFileSync(join(fixture.target, "changed.txt"), "utf8"), "before\n");
+    assert.equal(git(reviewTree, "rev-parse", "HEAD"), fixture.headSha);
+    assert.equal(readFileSync(join(reviewTree, "changed.txt"), "utf8"), "after\n");
+    assert.equal(readFileSync(join(reviewTree, "added.txt"), "utf8"), "new implementation\n");
+    assert.equal(git(fixture.target, "status", "--porcelain"), "");
+    assert.equal(git(reviewTree, "status", "--porcelain"), "");
+    assert.equal(
+      git(fixture.target, "rev-parse", "refs/clawsweeper/review-cache/head-982"),
+      fixture.headSha,
+    );
+    assert.equal(
+      removePullRequestReviewTree({ targetDir: fixture.target, worktreeDir: reviewTree }),
+      true,
+    );
+    assert.equal(existsSync(reviewTree), false);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("manual live proof admits pinned promisor trees with the requested repository and restores its profile", async (t) => {
+  for (const scenario of ["admitted", "missing", "truncated", "overflow", "unavailable"] as const) {
+    await t.test(scenario, async (t) => {
+      const fixture = partialCloneFixture({ attributes: true });
+      const previousInvocation = process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION;
+      t.after(() => {
+        t.mock.restoreAll();
+        syncBuiltinESMExports();
+        if (previousInvocation === undefined)
+          delete process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION;
+        else process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION = previousInvocation;
+        rmSync(fixture.root, { recursive: true, force: true });
+      });
+      const repo =
+        process.env.CLAWSWEEPER_TARGET_REPO === "openclaw/clawsweeper"
+          ? "openclaw/openclaw"
+          : "openclaw/clawsweeper";
+      const records = join(fixture.root, "records");
+      const output = join(fixture.root, "output");
+      mkdirSync(records);
+      writeFileSync(
+        join(records, "982.md"),
+        `---\nnumber: 982\nrepository: ${repo}\ntype: pull_request\npull_head_sha: ${fixture.headSha}\n---\n\n## Live Proof\n\nStatus: recommended\n\nSurface: terminal\n\nTerminal completion: exit_zero\n\nReason: Verify the pinned fixture.\n\nPayoff: static_text\n\nPayoff justification: Text is sufficient.\n\nEntry: printf fixture-ready\n\nSteps:\n\n- {"action":"expect_output","text":"fixture-ready"}\n\n## Work Candidate\n\nCandidate: none\n`,
+      );
+      const tree = git(
+        fixture.source,
+        "ls-tree",
+        "-r",
+        "--format=%(objecttype) %(objectname) %(objectsize)",
+        fixture.headSha,
+      )
+        .split("\n")
+        .map((line) => {
+          const [type, sha, size] = line.split(" ");
+          return { type, sha, size: Number(size) };
+        });
+      const attributes = git(fixture.source, "rev-parse", `${fixture.headSha}:.gitattributes`);
+      writeFileSync(join(fixture.target, "changed.txt"), "unreviewed checkout must not execute\n");
+      const statusBefore = git(fixture.target, "status", "--porcelain");
+      const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+      const profileBefore = reviewPolicyHashForTest();
+      assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+      let metadataCalls = 0;
+      let childLaunches = 0;
+      t.mock.method(console, "log", () => {});
+      const nativeSpawn = childProcess.spawnSync;
+      t.mock.method(childProcess, "spawnSync", (...args: Parameters<typeof nativeSpawn>) => {
+        const argv = args[1] ?? [];
+        if (argv[0] === "api") {
+          metadataCalls++;
+          assert.deepEqual(argv.slice(0, 2), [
+            "api",
+            `repos/${repo}/git/trees/${fixture.headSha}?recursive=1`,
+          ]);
+          assert.notEqual(reviewPolicyHashForTest(), profileBefore);
+          assert.ok(args[2]?.timeout && args[2].timeout <= 30_000);
+          if (scenario === "unavailable") throw new Error("fixture metadata unavailable");
+          const response = {
+            truncated: scenario === "truncated",
+            tree: tree
+              .filter((entry) => scenario !== "missing" || entry.sha !== fixture.addedBlobSha)
+              .map((entry) =>
+                scenario === "overflow" && entry.type === "blob" && entry.sha !== attributes
+                  ? { ...entry, size: REVIEW_TREE_MAX_BYTES / 4 }
+                  : entry,
+              ),
+          };
+          const filter = argv.indexOf("--jq");
+          return filter < 0
+            ? { status: 0, stdout: JSON.stringify(response), stderr: "" }
+            : nativeSpawn("jq", ["-c", argv[filter + 1]!], {
+                ...args[2],
+                input: JSON.stringify(response),
+                stdio: ["pipe", "pipe", "pipe"],
+              });
+        }
+        if (args[0] === process.execPath && argv[1] === "live-proof") {
+          childLaunches++;
+          assert.equal(reviewPolicyHashForTest(), profileBefore);
+          assert.equal(argv[argv.indexOf("--repo") + 1], repo);
+          const checkout = String(args[2]?.cwd);
+          assert.equal(git(checkout, "rev-parse", "HEAD"), fixture.headSha);
+          assert.equal(readFileSync(join(checkout, "changed.txt"), "utf8"), "after\n");
+          writeFileSync(
+            join(argv[argv.indexOf("--output") + 1]!, "live-verification.json"),
+            JSON.stringify({ head_sha: fixture.headSha, repo }),
+          );
+          return {
+            status: 0,
+            stdout: "[live-proof] sanitized environment assertion passed: credentials=0\n",
+            stderr: "",
+          };
+        }
+        assert.equal(args[0], "git", "unexpected external command");
+        return nativeSpawn(...args);
+      });
+      syncBuiltinESMExports();
+      const execution = main(
+        [
+          "live-proof-review",
+          "--repo",
+          repo,
+          "--records-dir",
+          records,
+          "--checkout",
+          fixture.target,
+          "--output",
+          output,
+          "--item",
+          "982",
+        ],
+        { flushWorkflowActionEvents: async () => [] },
+      );
+      if (scenario === "admitted") {
+        await execution;
+        assert.equal(childLaunches, 1);
+        assert.deepEqual(
+          JSON.parse(readFileSync(join(output, "982", "live-verification.json"), "utf8")),
+          { head_sha: fixture.headSha, repo },
+        );
+      } else {
+        await assert.rejects(execution, (error: unknown) => {
+          assert.ok(error instanceof ReviewSourcePreparationError);
+          assert.equal(error.diagnosticReason, "review_checkout_unavailable");
+          assert.match(
+            error.message,
+            scenario === "overflow"
+              ? /conservatively projected bytes/
+              : /remote blob size metadata is (?:unavailable|incomplete)/,
+          );
+          return true;
+        });
+        assert.equal(childLaunches, 0);
+        assert.equal(existsSync(output), false);
+        assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+      }
+      // Attributes and content request separate size sets but share one pinned tree response.
+      assert.equal(metadataCalls, 1);
+      assert.equal(reviewPolicyHashForTest(), profileBefore);
+      assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+      assert.equal(git(fixture.target, "status", "--porcelain"), statusBefore);
+      assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+      assert.equal(
+        readFileSync(join(fixture.target, "changed.txt"), "utf8"),
+        "unreviewed checkout must not execute\n",
+      );
+    });
+  }
+});
+
+test("restricted review rejects one tracked 2.5 GiB blob before worktree materialization", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const reviewTree = join(fixture.root, "oversized-tree");
+  try {
+    const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTreeForTest(
+          {
+            targetDir: fixture.target,
+            worktreeDir: reviewTree,
+            itemNumber: 982,
+            headSha: fixture.headSha,
+          },
+          {
+            maxFiles: 200_000,
+            maxBytes: 2 * 1024 * 1024 * 1024,
+            diskReserveBytes: 1024 * 1024 * 1024,
+            diskCapacity: {
+              workspaceAvailableBytes: 3 * 1024 * 1024 * 1024,
+              objectStoreAvailableBytes: 3 * 1024 * 1024 * 1024,
+              sameFileSystem: true,
+            },
+          },
+          {
+            paths: ["oversized.bin"],
+            blobBytes: BigInt(2.5 * 1024 * 1024 * 1024),
+          },
+        ),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /conservatively projected bytes/.test(error.message),
+    );
+    assert.equal(existsSync(reviewTree), false);
+    assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review admits shared and separate filesystem budgets independently", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+  const missingBlob = "a".repeat(40);
+  const scenarios = [
+    {
+      name: "shared",
+      worktreeDir: join(fixture.root, "shared-capacity-tree"),
+      blobBytes: 40n,
+      missingBytes: 30,
+      reserveBytes: 10,
+      capacity: {
+        workspaceAvailableBytes: 100,
+        objectStoreAvailableBytes: 100,
+        sameFileSystem: true,
+      },
+      message: /shared-filesystem bytes/,
+    },
+    {
+      name: "workspace",
+      worktreeDir: join(fixture.root, "workspace-capacity-tree"),
+      blobBytes: 50n,
+      missingBytes: 1,
+      reserveBytes: 10,
+      capacity: {
+        workspaceAvailableBytes: 109,
+        objectStoreAvailableBytes: 1_000,
+        sameFileSystem: false,
+      },
+      message: /workspace bytes/,
+    },
+    {
+      name: "object store",
+      worktreeDir: join(fixture.root, "object-capacity-tree"),
+      blobBytes: 1n,
+      missingBytes: 100,
+      reserveBytes: 10,
+      capacity: {
+        workspaceAvailableBytes: 1_000,
+        objectStoreAvailableBytes: 109,
+        sameFileSystem: false,
+      },
+      message: /object-store bytes/,
+    },
+  ] as const;
+  try {
+    for (const scenario of scenarios) {
+      assert.throws(
+        () =>
+          materializePullRequestReviewTreeForTest(
+            {
+              targetDir: fixture.target,
+              worktreeDir: scenario.worktreeDir,
+              itemNumber: 982,
+              headSha: fixture.headSha,
+            },
+            {
+              maxFiles: 100,
+              maxBytes: 1_000,
+              diskReserveBytes: scenario.reserveBytes,
+              diskCapacity: scenario.capacity,
+            },
+            {
+              paths: ["fixture.txt"],
+              blobBytes: scenario.blobBytes,
+              missingBlobs: [{ objectId: missingBlob, bytes: scenario.missingBytes }],
+            },
+          ),
+        (error) =>
+          error instanceof ReviewSourcePreparationError &&
+          error.diagnosticReason === "review_checkout_unavailable" &&
+          scenario.message.test(error.message),
+        scenario.name,
+      );
+      assert.equal(existsSync(scenario.worktreeDir), false, scenario.name);
+    }
+    assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review rejects oversized remote blob metadata before fetching or checkout", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const reviewTree = join(fixture.root, "oversized-remote-tree");
+  try {
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    const worktreesBefore = git(fixture.target, "worktree", "list", "--porcelain");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTree({
+          targetDir: fixture.target,
+          worktreeDir: reviewTree,
+          itemNumber: 982,
+          headSha: fixture.headSha,
+          resolveBlobSizes: (objectIds) =>
+            new Map(objectIds.map((objectId) => [objectId, 2.5 * 1024 * 1024 * 1024])),
+        }),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /conservatively projected bytes/.test(error.message),
+    );
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    assert.equal(existsSync(reviewTree), false);
+    assert.equal(git(fixture.target, "worktree", "list", "--porcelain"), worktreesBefore);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review hydrates only bounded attributes before rejecting a remote filter", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  const reviewTree = join(fixture.root, "filtered-remote-tree");
+  try {
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt filter=inflate\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "configure remote checkout filter");
+    const headSha = git(fixture.source, "rev-parse", "HEAD");
+    git(fixture.source, "push", "-q", "--force", "origin", "HEAD:refs/pull/982/head");
+    const requested: string[][] = [];
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+
+    assert.throws(
+      () =>
+        materializePullRequestReviewTree({
+          targetDir: fixture.target,
+          worktreeDir: reviewTree,
+          itemNumber: 982,
+          headSha,
+          resolveBlobSizes: (objectIds) => {
+            requested.push([...objectIds]);
+            return resolveFixtureBlobSizes(fixture.source)(objectIds);
+          },
+        }),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /unbounded filter/.test(error.message),
+    );
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0]!.length, 1);
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    assert.equal(existsSync(reviewTree), false);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review refuses unbounded filters and admits bounded EOL expansion", () => {
+  const fixture = partialCloneFixture();
+  const rejectedTree = join(fixture.root, "filtered-tree");
+  const admittedTree = join(fixture.root, "eol-tree");
+  const filterMarker = join(fixture.root, "filter-ran");
+  const hookMarker = join(fixture.root, "hook-ran");
+  try {
+    git(
+      fixture.source,
+      "config",
+      "filter.inflate.smudge",
+      `/usr/bin/touch ${filterMarker}; /bin/cat`,
+    );
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt filter=inflate\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "configure checkout filter");
+    const filteredHead = git(fixture.source, "rev-parse", "HEAD");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTreeForTest(
+          {
+            targetDir: fixture.source,
+            worktreeDir: rejectedTree,
+            itemNumber: 982,
+            headSha: filteredHead,
+          },
+          {
+            maxFiles: 100,
+            maxBytes: 1024 * 1024,
+            diskReserveBytes: 0,
+            diskCapacity: {
+              workspaceAvailableBytes: 1024 * 1024,
+              objectStoreAvailableBytes: 1024 * 1024,
+              sameFileSystem: true,
+            },
+          },
+        ),
+      (error) =>
+        error instanceof ReviewSourcePreparationError &&
+        error.diagnosticReason === "review_checkout_unavailable" &&
+        /unbounded filter/.test(error.message),
+    );
+    assert.equal(existsSync(rejectedTree), false);
+    assert.equal(existsSync(filterMarker), false);
+
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt text eol=crlf\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "use bounded EOL conversion");
+    const eolHead = git(fixture.source, "rev-parse", "HEAD");
+    const postCheckoutHook = join(fixture.source, ".git", "hooks", "post-checkout");
+    writeFileSync(postCheckoutHook, `#!/bin/sh\n/usr/bin/touch ${hookMarker}\n`);
+    chmodSync(postCheckoutHook, 0o755);
+    assert.equal(
+      materializePullRequestReviewTreeForTest(
+        {
+          targetDir: fixture.source,
+          worktreeDir: admittedTree,
+          itemNumber: 982,
+          headSha: eolHead,
+        },
+        {
+          maxFiles: 100,
+          maxBytes: 1024 * 1024,
+          diskReserveBytes: 0,
+          diskCapacity: {
+            workspaceAvailableBytes: 1024 * 1024,
+            objectStoreAvailableBytes: 1024 * 1024,
+            sameFileSystem: true,
+          },
+        },
+      ),
+      true,
+    );
+    assert.match(readFileSync(join(admittedTree, "changed.txt"), "utf8"), /\r\n$/);
+    assert.equal(existsSync(hookMarker), false);
+  } finally {
+    removePullRequestReviewTree({ targetDir: fixture.source, worktreeDir: admittedTree });
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review uses a private Git 2.39-compatible attribute index and cleans it", () => {
+  const fixture = partialCloneFixture();
+  const reviewTreesDir = join(fixture.root, "review-trees");
+  const reviewTree = join(reviewTreesDir, "filtered-tree");
+  const binDir = join(fixture.root, "bin");
+  const commandLog = join(fixture.root, "git-commands.log");
+  const indexLog = join(fixture.root, "git-indexes.log");
+  const hookMarker = join(fixture.root, "post-index-change-ran");
+  const fsmonitorMarker = join(fixture.root, "fsmonitor-ran");
+  const previousPath = process.env.PATH;
+  try {
+    writeFileSync(join(fixture.source, ".gitattributes"), "*.txt filter=inflate\n");
+    git(fixture.source, "add", ".gitattributes");
+    git(fixture.source, "commit", "-qm", "configure checkout filter");
+    const filteredHead = git(fixture.source, "rev-parse", "HEAD");
+    const hooksDir = join(fixture.root, "hooks");
+    mkdirSync(hooksDir);
+    writeFileSync(
+      join(hooksDir, "post-index-change"),
+      `#!/bin/sh\n/usr/bin/touch ${JSON.stringify(hookMarker)}\n`,
+    );
+    chmodSync(join(hooksDir, "post-index-change"), 0o755);
+    git(fixture.source, "config", "core.hooksPath", hooksDir);
+    const fsmonitor = join(fixture.root, "fsmonitor");
+    writeFileSync(
+      fsmonitor,
+      `#!/bin/sh\n/usr/bin/touch ${JSON.stringify(fsmonitorMarker)}\nprintf 'builtin:fake\\n'\n`,
+    );
+    chmodSync(fsmonitor, 0o755);
+    git(fixture.source, "config", "core.fsmonitor", fsmonitor);
+    mkdirSync(reviewTreesDir);
+    mkdirSync(binDir);
+    const shim = join(binDir, "git");
+    writeFileSync(
+      shim,
+      `#!/bin/sh
+printf '%s\n' "$*" >> ${JSON.stringify(commandLog)}
+for arg in "$@"; do
+  case "$arg" in
+    --source=*) exit 97 ;;
+  esac
+done
+case "$*" in
+  *" read-tree "*|*" check-attr "*)
+    printf '%s\n' "$GIT_INDEX_FILE" >> ${JSON.stringify(indexLog)}
+    ;;
+esac
+exec /usr/bin/git "$@"
+`,
+    );
+    chmodSync(shim, 0o755);
+    process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+
+    assert.throws(
+      () =>
+        materializePullRequestReviewTreeForTest(
+          {
+            targetDir: fixture.source,
+            worktreeDir: reviewTree,
+            itemNumber: 982,
+            headSha: filteredHead,
+          },
+          {
+            maxFiles: 100,
+            maxBytes: 1024 * 1024,
+            diskReserveBytes: 0,
+            diskCapacity: {
+              workspaceAvailableBytes: 1024 * 1024,
+              objectStoreAvailableBytes: 1024 * 1024,
+              sameFileSystem: true,
+            },
+          },
+        ),
+      /unbounded filter/,
+    );
+    const commands = readFileSync(commandLog, "utf8");
+    assert.match(
+      commands,
+      /-c core\.hooksPath=\S+ -c core\.fsmonitor=false -c core\.splitIndex=false read-tree/,
+    );
+    assert.match(
+      commands,
+      /-c core\.hooksPath=\S+ -c core\.fsmonitor=false -c core\.splitIndex=false check-attr --cached/,
+    );
+    assert.doesNotMatch(commands, /--source=/);
+    assert.equal(existsSync(hookMarker), false);
+    assert.equal(existsSync(fsmonitorMarker), false);
+    const indexPaths = readFileSync(indexLog, "utf8").trim().split("\n");
+    assert.ok(indexPaths.length >= 2);
+    for (const indexPath of indexPaths) {
+      assert.ok(indexPath.startsWith(`${reviewTreesDir}/.clawsweeper-attributes-`));
+      assert.equal(existsSync(indexPath), false);
+      assert.equal(existsSync(join(indexPath, "..")), false);
+    }
+    assert.equal(existsSync(reviewTree), false);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review treats zero inode statistics as unavailable", () => {
+  const fixture = partialCloneFixture();
+  const reviewTree = join(fixture.root, "zero-inode-tree");
+  const originalStatfsSync = fs.statfsSync;
+  try {
+    fs.statfsSync = ((path, options) => {
+      const result = originalStatfsSync(path, options as never);
+      return { ...result, files: 0, ffree: 0 };
+    }) as typeof fs.statfsSync;
+    syncBuiltinESMExports();
+    assert.equal(
+      materializePullRequestReviewTreeForTest(
+        {
+          targetDir: fixture.source,
+          worktreeDir: reviewTree,
+          itemNumber: 982,
+          headSha: fixture.headSha,
+        },
+        {
+          maxFiles: 100,
+          maxBytes: 1024 * 1024,
+          diskReserveBytes: 0,
+          diskCapacity: {
+            workspaceAvailableBytes: 1024 * 1024,
+            objectStoreAvailableBytes: 1024 * 1024,
+            sameFileSystem: true,
+          },
+        },
+      ),
+      true,
+    );
+  } finally {
+    fs.statfsSync = originalStatfsSync;
+    syncBuiltinESMExports();
+    removePullRequestReviewTree({ targetDir: fixture.source, worktreeDir: reviewTree });
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("restricted review binds a force-pushed pull request to the exact REST head", () => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  try {
+    git(fixture.source, "push", "-q", "origin", "HEAD:refs/heads/feature");
+    git(fixture.source, "push", "-q", "--force", "origin", `${fixture.baseSha}:refs/pull/982/head`);
+
+    assert.equal(
+      ensurePullRequestReviewHead({
+        targetDir: fixture.target,
+        itemNumber: 982,
+        headSha: fixture.headSha,
+      }),
+      true,
+    );
+    assert.equal(
+      git(fixture.target, "rev-parse", "refs/clawsweeper/review-cache/head-982"),
+      fixture.headSha,
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review hydration refuses unsafe Git paths and missing source without fetching", () => {
+  const fixture = partialCloneFixture();
+  try {
+    for (const filename of ["a\\b", "C:drive", "control\npath"]) {
+      writeFileSync(join(fixture.source, filename), "unsafe path\n");
+      git(fixture.source, "add", ".");
+      git(fixture.source, "commit", "-qm", "unsafe source");
+      const headSha = git(fixture.source, "rev-parse", "HEAD");
+      git(fixture.source, "push", "-q", "origin", "HEAD:refs/heads/unsafe");
+      git(fixture.target, "fetch", "-q", "--filter=blob:none", "origin", "refs/heads/unsafe");
+      assert.throws(
+        () =>
+          hydratePullRequestReviewBlobs({
+            targetDir: fixture.target,
+            baseSha: fixture.baseSha,
+            headSha,
+            resolveBlobSizes: () => {
+              throw new Error("unsafe paths must refuse before metadata");
+            },
+          }),
+        { name: "AgentInputScanError", reason: "unsafe_path", retryable: false },
+      );
+      git(fixture.source, "rm", "-q", "--", filename);
+    }
+    for (const baseSha of ["--unsafe", "f".repeat(40)]) {
+      assert.throws(
+        () =>
+          hydratePullRequestReviewBlobs({
+            targetDir: fixture.target,
+            baseSha,
+            headSha: fixture.headSha,
+          }),
+        { name: "AgentInputScanError", reason: "incomplete_source", retryable: false },
+      );
+    }
+    assert.throws(
+      () =>
+        hydratePullRequestReviewBlobs({
+          targetDir: fixture.target,
+          baseSha: fixture.baseSha,
+          headSha: fixture.headSha,
+        }),
+      {
+        diagnosticStage: "source_preparation",
+        diagnosticReason: "review_blob_metadata_unavailable",
+      },
+    );
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("missing partial-clone objects are fetched in one bounded network request", () => {
+  const fixture = partialCloneFixture({ extraFiles: 12 });
+  const previousTrace = process.env.GIT_TRACE2_EVENT;
+  const trace = join(fixture.root, "git-trace.jsonl");
+  try {
+    const paths = Array.from({ length: 12 }, (_, index) => `additional-${index}.txt`);
+    const expectedBlobIds = paths.map((path) => git(fixture.source, "rev-parse", `HEAD:${path}`));
+    const probeOutput = git(
+      fixture.target,
+      "--literal-pathspecs",
+      "rev-list",
+      "--objects",
+      "--missing=print",
+      `${fixture.baseSha}^{tree}`,
+      `${fixture.headSha}^{tree}`,
+      "--",
+      ...paths,
+    );
+    const probedObjectIds = new Set(
+      probeOutput.split("\n").map((entry) => entry.match(/^\??([0-9a-f]{40,64})(?: |$)/i)?.[1]),
+    );
+    assert.deepEqual(
+      expectedBlobIds.filter((objectId) => !probedObjectIds.has(objectId)),
+      [],
+      "availability probe must emit every blob ID reached from the bounded commit trees",
+    );
+
+    process.env.GIT_TRACE2_EVENT = trace;
+    const result = hydratePullRequestReviewBlobs({
+      targetDir: fixture.target,
+      baseSha: fixture.baseSha,
+      headSha: fixture.headSha,
+      resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+    });
+    if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT;
+    else process.env.GIT_TRACE2_EVENT = previousTrace;
+
+    const traceEvents = readFileSync(trace, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { event: string; argv?: string[] });
+    const revLists = traceEvents.filter(
+      (event) => event.event === "start" && event.argv?.includes("rev-list"),
+    );
+    const nestedFetches = traceEvents.filter(
+      (event) => event.event === "child_start" && event.argv?.includes("fetch"),
+    );
+    const explicitFetches = traceEvents.filter(
+      (event) => event.event === "start" && event.argv?.includes("fetch"),
+    );
+    assert.equal(result, 18);
+    assert.equal(revLists.length, 1);
+    assert.ok(revLists[0]!.argv?.includes(`${fixture.baseSha}^{tree}`));
+    assert.ok(revLists[0]!.argv?.includes(`${fixture.headSha}^{tree}`));
+    assert.equal(
+      revLists[0]!.argv?.some((argument) => argument.startsWith("--no-walk")),
+      false,
+    );
+    assert.equal(nestedFetches.length, 0, "availability probe must not lazy-fetch blobs");
+    assert.equal(explicitFetches.length, 1, "hydration must perform one explicit bounded fetch");
+    assert.ok(explicitFetches[0]!.argv?.includes("--stdin"));
+  } finally {
+    if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT;
+    else process.env.GIT_TRACE2_EVENT = previousTrace;
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review hydration rejects aggregate scan budget overflow and incomplete size metadata before fetching", () => {
+  const fixture = partialCloneFixture();
+  try {
+    for (const size of [MAX_SCAN_BYTES + 1, Math.ceil(MAX_SCAN_BYTES / 2)]) {
+      assert.throws(
+        () =>
+          hydratePullRequestReviewBlobs({
+            targetDir: fixture.target,
+            baseSha: fixture.baseSha,
+            headSha: fixture.headSha,
+            resolveBlobSizes: (ids) => new Map(ids.map((id) => [id, size as number])),
+          }),
+        { name: "AgentInputScanError", reason: "staging_limit", retryable: false },
+      );
+      assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    }
+    for (const size of [NaN, -1, undefined]) {
+      assert.throws(
+        () =>
+          hydratePullRequestReviewBlobs({
+            targetDir: fixture.target,
+            baseSha: fixture.baseSha,
+            headSha: fixture.headSha,
+            resolveBlobSizes: (ids) => new Map(ids.map((id) => [id, size as number])),
+          }),
+        {
+          diagnosticStage: "source_preparation",
+          diagnosticReason: "review_blob_metadata_unavailable",
+        },
+      );
+      assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    }
+    git(fixture.target, "remote", "set-url", "origin", join(fixture.root, "unavailable.git"));
+    assert.throws(
+      () =>
+        hydratePullRequestReviewBlobs({
+          targetDir: fixture.target,
+          baseSha: fixture.baseSha,
+          headSha: fixture.headSha,
+          resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+        }),
+      { diagnosticStage: "source_preparation", diagnosticReason: "review_blobs_unavailable" },
+    );
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("source preparation reports unavailable historical blobs before restricted inspection", () => {
+  const fixture = partialCloneFixture({ historicalBase: true, prefetchHead: false });
+  const reviewTree = join(fixture.root, "review-tree");
+  const unavailable = () => {
+    throw new Error("Unexpected external dependency in local source-preparation fixture");
+  };
+  const { hydratePullRequestReviewSource } = createContextHydration(
+    new Proxy(
+      {
+        asRecord,
+        stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
+        isSafeGitBranchName: (branch: string) => branch === "main",
+        targetRepo: () => "fixture/repository",
+        ghJson: (args: string[]) => {
+          assert.equal(args[0], "api");
+          assert.deepEqual(args.slice(2), [
+            "--jq",
+            '{truncated, tree: (.tree | if type == "array" then map(if type == "object" then {type, sha, size} else . end) else . end)}',
+          ]);
+          const revision = args[1]?.match(/\/git\/trees\/([0-9a-f]+)\?recursive=1$/)?.[1];
+          assert.ok(revision);
+          const tree = git(fixture.source, "ls-tree", "-r", "-l", revision)
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => {
+              const match = line.match(/^\d+ (\w+) ([0-9a-f]+)\s+(-|\d+)\t/);
+              assert.ok(match);
+              return match[1] === "blob"
+                ? { type: "blob", sha: match[2], size: Number(match[3]) }
+                : { type: match[1], sha: match[2] };
+            });
+          return { truncated: false, tree };
+        },
+      },
+      { get: (target, key) => Reflect.get(target, key) ?? unavailable },
+    ) as Parameters<typeof createContextHydration>[0],
+  );
+  try {
+    // Construct a main-only unsafe path in Git without relying on host filesystem
+    // filename support. Its optional endpoint delta must not block the PR delta.
+    const previousBase = git(fixture.source, "rev-parse", "HEAD");
+    const mainBlob = git(fixture.source, "rev-parse", "HEAD:changed.txt");
+    const baseTree = execFileSync("git", ["ls-tree", "-z", "HEAD"], { cwd: fixture.source });
+    const treeSha = execFileSync("git", ["mktree", "-z"], {
+      cwd: fixture.source,
+      encoding: "utf8",
+      input: Buffer.concat([
+        baseTree,
+        Buffer.from("100644 blob " + mainBlob + "\tbase-only\npath\0"),
+      ]),
+    }).trim();
+    const baseSha = git(
+      fixture.source,
+      "commit-tree",
+      treeSha,
+      "-p",
+      previousBase,
+      "-m",
+      "main-only path",
+    );
+    git(fixture.source, "update-ref", "refs/heads/main", baseSha);
+    git(fixture.source, "push", "-q", "origin", "main");
+    git(fixture.target, "fetch", "-q", "--filter=blob:none", "origin", "main");
+    const removedOid = git(fixture.source, "rev-parse", fixture.baseSha + ":removed.txt");
+    assert.ok(
+      ensurePullRequestReviewHead({
+        targetDir: fixture.target,
+        itemNumber: 982,
+        headSha: fixture.headSha,
+      }),
+    );
+    assert.equal(reviewMergeBase(fixture.target, baseSha, fixture.headSha).sha, fixture.baseSha);
+    assert.equal(objectExistsOffline(fixture.target, removedOid), false);
+    const prepare = () =>
+      hydratePullRequestReviewSource({
+        itemNumber: 982,
+        targetDir: fixture.target,
+        pullRequest: {
+          base: { ref: "main", sha: baseSha },
+          head: { sha: fixture.headSha },
+        },
+      });
+    const origin = git(fixture.target, "remote", "get-url", "origin");
+    git(fixture.target, "remote", "set-url", "origin", join(fixture.root, "unavailable.git"));
+    assert.throws(prepare, {
+      diagnosticStage: "source_preparation",
+      diagnosticReason: "review_blobs_unavailable",
+      reviewedHeadSha: fixture.headSha,
+    });
+    assert.equal(objectExistsOffline(fixture.target, removedOid), false);
+
+    git(fixture.target, "remote", "set-url", "origin", origin);
+    prepare();
+    assert.ok(
+      materializePullRequestReviewTree({
+        targetDir: fixture.target,
+        worktreeDir: reviewTree,
+        itemNumber: 982,
+        headSha: fixture.headSha,
+      }),
+    );
+    assert.equal(git(reviewTree, "rev-parse", "HEAD"), fixture.headSha);
+    assert.equal(reviewMergeBase(reviewTree, baseSha, fixture.headSha).sha, fixture.baseSha);
+    git(fixture.target, "remote", "set-url", "origin", join(fixture.root, "offline.git"));
+    const args = [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "--ignore-submodules=none",
+      fixture.baseSha,
+      fixture.headSha,
+      "--patch",
+      "--binary",
+      "--full-index",
+      "--",
+    ];
+    const patch = readReviewGit(reviewTree, args);
+    assert.ok(patch);
+    assert.deepEqual(patch, readReviewGit(fixture.source, args));
+    assert.equal(git(reviewTree, "status", "--porcelain"), "");
+  } finally {
+    removePullRequestReviewTree({ targetDir: fixture.target, worktreeDir: reviewTree });
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review blob sizes use one bounded GraphQL metadata request", () => {
+  const objectIds = ["a".repeat(40), "b".repeat(40)];
+  let requests = 0;
+  const result = githubReviewBlobSizes({
+    repository: "openclaw/clawsweeper",
+    objectIds,
+    request: (query) => {
+      requests += 1;
+      assert.match(query, /repository\(owner: "openclaw", name: "clawsweeper"\)/);
+      assert.match(query, /b0: object\(oid:/);
+      assert.match(query, /b1: object\(oid:/);
+      return { data: { repository: { b0: { byteSize: 12 }, b1: { byteSize: 34 } } } };
+    },
+  });
+
+  assert.equal(requests, 1);
+  assert.deepEqual(
+    [...result],
+    [
+      [objectIds[0], 12],
+      [objectIds[1], 34],
+    ],
+  );
+  assert.throws(
+    () => githubReviewBlobSizes({ repository: "../unsafe", objectIds, request: () => ({}) }),
+    /invalid bounded review blob metadata request/,
+  );
+});
+
+test("review checkout preserves large tree metadata within the GitHub CLI capture limit", () => {
+  const fixture = partialCloneFixture();
+  const reviewTree = join(fixture.root, "review-tree");
+  const metadataPath = join(fixture.root, "tree.json");
+  const tree = git(fixture.source, "ls-tree", "-rl", fixture.headSha)
+    .split("\n")
+    .map((line) => {
+      const match = /^(\d+) (\w+) ([0-9a-f]+)\s+(\d+|-)\t(.+)$/.exec(line);
+      assert.ok(match);
+      return {
+        mode: match[1],
+        type: match[2],
+        sha: match[3],
+        size: match[4] === "-" ? null : Number(match[4]),
+        path: match[5],
+        url: `https://api.github.com/repos/fixture/repository/git/blobs/${match[3]}`,
+      };
+    });
+  for (let index = 0; index < 33_000; index += 1) {
+    const sha = index.toString(16).padStart(40, "0");
+    tree.push({
+      mode: "100644",
+      type: "blob",
+      sha,
+      size: index + 1,
+      path: `synthetic/packages/${index}/${"segment/".repeat(20)}entry.ts`,
+      url: `https://api.github.com/repos/fixture/repository/git/blobs/${sha}`,
+    });
+  }
+  const metadata = { truncated: false, tree };
+  const raw = JSON.stringify(metadata);
+  assert.ok(Buffer.byteLength(raw) > 8 * 1024 * 1024);
+  writeFileSync(metadataPath, raw);
+  const unavailable = () => {
+    throw new Error("Unexpected dependency in tree metadata fixture");
+  };
+  let captured: typeof metadata | undefined;
+  const runtime = createGitHubRuntime({
+    ROOT: fixture.root,
+    run: unavailable,
+    targetRepo: () => "fixture/repository",
+  });
+  const context = createContextHydration(
+    new Proxy(
+      {
+        asRecord,
+        targetRepo: () => "fixture/repository",
+        ghJsonOnce: (args: string[], timeoutMs: number) => {
+          const output = runtime.ghOnce(args, timeoutMs);
+          assert.ok(Buffer.byteLength(output) < 8 * 1024 * 1024);
+          captured = JSON.parse(output);
+          return captured;
+        },
+      },
+      { get: (target, key) => Reflect.get(target, key) ?? unavailable },
+    ) as Parameters<typeof createContextHydration>[0],
+  );
+  const materialize = () =>
+    context.materializePullRequestReviewTree({
+      targetDir: fixture.target,
+      worktreeDir: reviewTree,
+      itemNumber: 982,
+      headSha: fixture.headSha,
+    });
+  try {
+    withMockGh(
+      fixture.root,
+      `const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const filter = args.indexOf("--jq");
+if (filter < 0) {
+  process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(metadataPath)}));
+} else {
+  const result = spawnSync("jq", ["-c", args[filter + 1], ${JSON.stringify(metadataPath)}], { stdio: "inherit" });
+  process.exitCode = result.status ?? 1;
+}
+`,
+      () => {
+        for (const invalid of [
+          { ...metadata, truncated: true },
+          { truncated: false, tree: { entry: tree[0] } },
+          { truncated: false, tree: [null, ...tree] },
+        ]) {
+          writeFileSync(metadataPath, JSON.stringify(invalid));
+          assert.throws(materialize, { diagnosticReason: "review_checkout_unavailable" });
+          assert.equal(existsSync(reviewTree), false);
+        }
+        writeFileSync(metadataPath, raw);
+        assert.equal(materialize(), true);
+      },
+    );
+    assert.deepEqual(captured, {
+      truncated: false,
+      tree: tree.map(({ type, sha, size }) => ({ type, sha, size })),
+    });
+    assert.equal(git(reviewTree, "rev-parse", "HEAD"), fixture.headSha);
+    assert.equal(readFileSync(join(reviewTree, "added.txt"), "utf8"), "new implementation\n");
+  } finally {
+    removePullRequestReviewTree({ targetDir: fixture.target, worktreeDir: reviewTree });
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("review tree blob sizes use one bounded recursive-tree request", () => {
+  const headSha = "a".repeat(40);
+  let requests = 0;
+  const result = githubReviewTreeBlobSizes({
+    repository: "openclaw/clawsweeper",
+    headSha,
+    request: (path) => {
+      requests += 1;
+      assert.equal(path, `repos/openclaw/clawsweeper/git/trees/${headSha}?recursive=1`);
+      return {
+        truncated: false,
+        tree: [
+          { type: "tree", sha: "b".repeat(40) },
+          { type: "blob", sha: "c".repeat(40), size: 12 },
+          { type: "blob", sha: "d".repeat(40), size: 34 },
+        ],
+      };
+    },
+  });
+
+  assert.equal(requests, 1);
+  assert.deepEqual(
+    [...result],
+    [
+      ["c".repeat(40), 12],
+      ["d".repeat(40), 34],
+    ],
+  );
+  assert.throws(
+    () =>
+      githubReviewTreeBlobSizes({
+        repository: "openclaw/clawsweeper",
+        headSha,
+        request: () => ({ truncated: true, tree: [] }),
+      }),
+    /incomplete bounded review tree metadata response/,
+  );
+});
+
+test("large pinned deltas hydrate historical blobs after head checkout and produce the full offline binary patch", (t) => {
+  const fixture = partialCloneFixture({
+    extraFiles: 170,
+    largeFiles: [3 * 1024 * 1024],
+    historicalBase: true,
+  });
+  const reviewTree = join(fixture.root, "review-tree");
+  try {
+    assert.notEqual(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+    assert.equal(
+      materializePullRequestReviewTree({
+        targetDir: fixture.target,
+        worktreeDir: reviewTree,
+        itemNumber: 982,
+        headSha: fixture.headSha,
+        resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+      }),
+      true,
+    );
+    const mergeBase = reviewMergeBase(reviewTree, fixture.baseSha, fixture.headSha);
+    assert.equal(mergeBase.sha, fixture.baseSha, "the REST base must not become current main");
+    const args = [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "--ignore-submodules=none",
+      fixture.baseSha,
+      fixture.headSha,
+    ];
+    const raw = readReviewGit(reviewTree, [...args, "--raw", "--no-abbrev", "-z", "--"]);
+    assert.ok(raw);
+    assert.equal(raw.toString().split("\0").length, 2 * 178 + 1);
+    const patchArgs = [...args, "--patch", "--binary", "--full-index", "--"];
+    assert.equal(
+      readReviewGit(reviewTree, patchArgs),
+      null,
+      "head checkout leaves historical blobs missing",
+    );
+    const removedOid = git(fixture.source, "rev-parse", `${fixture.baseSha}:removed.txt`);
+    assert.equal(objectExistsOffline(reviewTree, removedOid), false);
+    const batches: number[] = [];
+    const result = hydratePullRequestReviewBlobs({
+      targetDir: reviewTree,
+      baseSha: mergeBase.sha!,
+      headSha: fixture.headSha,
+      resolveBlobSizes: (objectIds) =>
+        githubReviewBlobSizes({
+          repository: "openclaw/clawsweeper",
+          objectIds,
+          request: (query) => {
+            const ids = [...query.matchAll(/b(\d+): object\(oid: "([0-9a-f]+)"\)/g)];
+            batches.push(ids.length);
+            const sizes = resolveFixtureBlobSizes(fixture.source)(ids.map((match) => match[2]!));
+            return {
+              data: {
+                repository: Object.fromEntries(
+                  ids.map((match) => [`b${match[1]}`, { byteSize: sizes.get(match[2]!) }]),
+                ),
+              },
+            };
+          },
+        }),
+    });
+    assert.equal(result, 349);
+    assert.deepEqual(batches, [160, 13]);
+    assert.equal(objectExistsOffline(reviewTree, removedOid), true);
+    git(fixture.target, "remote", "set-url", "origin", join(fixture.root, "offline.git"));
+    const patch = readReviewGit(reviewTree, patchArgs);
+    assert.ok(patch);
+    assert.deepEqual(patch, readReviewGit(fixture.source, patchArgs));
+    assert.match(patch.toString(), /GIT binary patch/);
+    assert.match(patch.toString(), /old mode 100644\nnew mode 100755/);
+    assert.match(patch.toString(), /deleted file mode 100644/);
+    assert.match(patch.toString(), /:\(glob\)literal.txt/);
+    assert.match(patch.toString(), /feature\[1\].txt/);
+    assert.equal(git(reviewTree, "status", "--porcelain"), "");
+    t.diagnostic(
+      JSON.stringify({
+        changedFiles: 178,
+        blobs: result,
+        metadataBatches: batches,
+        patchBytes: patch.length,
+        patchSha256: createHash("sha256").update(patch).digest("hex"),
+        patchUnreadableBefore: true,
+        offlinePatchMatchesSource: true,
+      }),
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});

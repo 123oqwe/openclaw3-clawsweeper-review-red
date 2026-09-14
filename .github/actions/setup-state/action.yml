@@ -1,0 +1,186 @@
+name: Setup ClawSweeper state
+description: Hydrate canonical Worker state and the remaining git-backed operational paths.
+inputs:
+  token:
+    description: GitHub token for the remaining git-backed state paths.
+    required: false
+    default: ""
+  state-path:
+    description: Checkout path for the generated state repository.
+    required: false
+    default: clawsweeper-state
+  worktree-path:
+    description: ClawSweeper checkout path to hydrate.
+    required: false
+    default: .
+  node-version:
+    description: Node.js version used to run the TypeScript hydrator.
+    required: false
+    default: "24"
+  filter:
+    description: Git partial clone filter for the generated state repository.
+    required: false
+    default: blob:none
+  fetch-depth:
+    description: Git fetch depth for the generated state repository.
+    required: false
+    default: "1"
+  sparse-checkout:
+    description: Optional newline-separated git-backed operational state paths.
+    required: false
+    default: ""
+  persist-credentials:
+    description: Persist the checkout token for later operational-state publication.
+    required: false
+    default: "true"
+  hydrate-git-state:
+    description: Check out jobs/results/notifications/report state from git.
+    required: false
+    default: "true"
+  coordinator-url:
+    description: Durable FIFO coordinator used before a git-backed state mutation.
+    required: false
+    default: https://clawsweeper.openclaw.ai
+  coordinator-class:
+    description: Durable state-writer scheduling class
+    required: false
+    default: ordinary
+  records-url:
+    description: Canonical Worker base URL.
+    required: false
+    default: https://clawsweeper.openclaw.ai
+  records-repo-slugs:
+    description: Optional comma/newline-separated record repository slugs.
+    required: false
+    default: ""
+  records-item-number:
+    description: Hydrate only these comma-separated item tuples instead of the complete repository snapshot.
+    required: false
+    default: ""
+  records-secret:
+    description: HMAC secret used for canonical Worker hydration.
+    required: false
+    default: ""
+  hydrate-records:
+    description: Hydrate canonical review records from the Worker.
+    required: false
+    default: "true"
+  hydrate-state-blobs:
+    description: Hydrate the canonical ledger/assets R2 trees.
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Check out operational state
+      if: ${{ inputs.hydrate-git-state == 'true' && inputs.sparse-checkout == '' }}
+      uses: actions/checkout@v7
+      with:
+        repository: openclaw/clawsweeper-state
+        ref: state
+        path: ${{ inputs.state-path }}
+        token: ${{ inputs.token }}
+        filter: ${{ inputs.filter }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        sparse-checkout: |
+          /jobs/
+          /results/
+          /notifications/
+          /apply-report.json
+          /repair-apply-report.json
+        sparse-checkout-cone-mode: false
+        persist-credentials: ${{ inputs.persist-credentials }}
+
+    - name: Check out selected operational state
+      if: ${{ inputs.hydrate-git-state == 'true' && inputs.sparse-checkout != '' }}
+      uses: actions/checkout@v7
+      with:
+        repository: openclaw/clawsweeper-state
+        ref: state
+        path: ${{ inputs.state-path }}
+        token: ${{ inputs.token }}
+        filter: ${{ inputs.filter }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        sparse-checkout: ${{ inputs.sparse-checkout }}
+        persist-credentials: ${{ inputs.persist-credentials }}
+
+    - name: Export state configuration
+      shell: bash
+      env:
+        STATE_COORDINATOR_URL: ${{ inputs.coordinator-url }}
+      run: |
+        {
+          echo "CLAWSWEEPER_STATE_DIR=$GITHUB_WORKSPACE/${{ inputs.state-path }}"
+          echo "CLAWSWEEPER_STATE_COORDINATOR_ENABLED=1"
+          echo "CLAWSWEEPER_STATE_COORDINATOR_URL=$STATE_COORDINATOR_URL"
+          echo "CLAWSWEEPER_STATE_COORDINATOR_CLASS=${{ inputs.coordinator-class }}"
+        } >> "$GITHUB_ENV"
+
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Resolve canonical record snapshot cache key
+      if: ${{ inputs.hydrate-records == 'true' && inputs.records-item-number == '' }}
+      id: records-snapshot
+      shell: bash
+      env:
+        CLAWSWEEPER_STATE_DIR: ${{ inputs.state-path }}
+        CLAWSWEEPER_RECORDS_URL: ${{ inputs.records-url }}
+        CLAWSWEEPER_RECORDS_REPO_SLUGS: ${{ inputs.records-repo-slugs }}
+        CLAWSWEEPER_RECORDS_SECRET: ${{ inputs.records-secret }}
+      run: node "${{ inputs.worktree-path }}/scripts/prepare-worker-record-cache.ts"
+
+    - name: Restore canonical record snapshot
+      if: ${{ inputs.hydrate-records == 'true' && inputs.records-item-number == '' && steps.records-snapshot.outputs.available == 'true' }}
+      uses: actions/cache@v6
+      with:
+        path: ${{ inputs.worktree-path }}/.artifacts/worker-records-cache
+        key: clawsweeper-records-${{ runner.os }}-${{ steps.records-snapshot.outputs.cache-key }}
+
+    - name: Restore canonical blob cache
+      if: ${{ inputs.hydrate-state-blobs == 'true' }}
+      uses: actions/cache@v6
+      with:
+        path: ${{ inputs.worktree-path }}/.artifacts/worker-blobs-cache
+        key: clawsweeper-blobs-${{ runner.os }}-${{ github.run_id }}
+        restore-keys: |
+          clawsweeper-blobs-${{ runner.os }}-
+
+    - name: Hydrate generated state
+      shell: bash
+      env:
+        CLAWSWEEPER_STATE_DIR: ${{ inputs.state-path }}
+        CLAWSWEEPER_RECORDS_URL: ${{ inputs.records-url }}
+        CLAWSWEEPER_RECORDS_REPO_SLUGS: ${{ inputs.records-repo-slugs }}
+        CLAWSWEEPER_RECORDS_SECRET: ${{ inputs.records-secret }}
+        RECORDS_ITEM_NUMBER: ${{ inputs.records-item-number }}
+        CLAWSWEEPER_RECORDS_CACHE_DIR: ${{ inputs.worktree-path }}/.artifacts/worker-records-cache
+        CLAWSWEEPER_BLOBS_CACHE_DIR: ${{ inputs.worktree-path }}/.artifacts/worker-blobs-cache
+        HYDRATE_STATE_BLOBS: ${{ inputs.hydrate-state-blobs }}
+        HYDRATE_RECORDS: ${{ inputs.hydrate-records }}
+        HYDRATE_GIT_STATE: ${{ inputs.hydrate-git-state }}
+      run: |
+        hydrate_args=(
+          --state-dir "${{ inputs.state-path }}"
+          --worktree "${{ inputs.worktree-path }}"
+        )
+        case "$HYDRATE_RECORDS" in
+          true) ;;
+          false) hydrate_args+=(--skip-records) ;;
+          *) echo "hydrate-records must be true or false" >&2; exit 2 ;;
+        esac
+        case "$HYDRATE_STATE_BLOBS" in
+          true) ;;
+          false) hydrate_args+=(--skip-state-blobs) ;;
+          *) echo "hydrate-state-blobs must be true or false" >&2; exit 2 ;;
+        esac
+        case "$HYDRATE_GIT_STATE" in
+          true) ;;
+          false) hydrate_args+=(--skip-git-state) ;;
+          *) echo "hydrate-git-state must be true or false" >&2; exit 2 ;;
+        esac
+        if [ -n "$RECORDS_ITEM_NUMBER" ]; then
+          hydrate_args+=(--records-item-number "$RECORDS_ITEM_NUMBER")
+        fi
+        node "${{ inputs.worktree-path }}/scripts/hydrate-state.ts" "${hydrate_args[@]}"

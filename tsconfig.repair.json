@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rewriteRelativeImportExtensions": true,
+    "lib": ["ES2024"],
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "useUnknownInCatchVariables": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  },
+  "include": [
+    "src/repair/**/*.ts",
+    "src/value-coerce.ts",
+    "src/content-hash.ts",
+    "src/clawsweeper-text.ts",
+    "src/required-env.ts",
+    "src/repository-profiles.ts",
+    "src/codex-output-capture.ts",
+    "src/codex-spawn.ts",
+    "src/codex-app-server-worker.ts",
+    "src/codex-process-worker.ts",
+    "src/github-egress-descriptor.ts",
+    "src/github-egress-observer.ts",
+    "src/github-egress-telemetry-contract.ts",
+    "src/github-webhook-read-model-client.ts"
+  ]
+}

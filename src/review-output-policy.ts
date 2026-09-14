@@ -1,0 +1,752 @@
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
+import type { Args } from "./clawsweeper-args.js";
+import { stringArg } from "./clawsweeper-args.js";
+import { UserFacingCommandError } from "./command.js";
+import { CODEX_THREAD_STATE_MAX_BYTES } from "./codex-output-capture.js";
+
+export type ReviewOutputRetention = "none" | "summary" | "debug";
+export type ReviewResultFormat = "text" | "json";
+
+export interface ReviewOutputSelection {
+  retention: ReviewOutputRetention;
+  resultFormat: ReviewResultFormat;
+  explicitDestination: boolean;
+  compatibilityRetention: boolean;
+}
+
+export interface TransientReviewOutput {
+  path: string;
+  cleanup: () => void;
+  addCleanup: (cleanup: () => void) => void;
+}
+
+export interface RetainedReviewOutput {
+  path: string;
+  retention: Exclude<ReviewOutputRetention, "none">;
+  ownerToken: string | null;
+}
+
+export interface ReviewOutputResult {
+  itemNumber?: number;
+  path: string | null;
+  markdown: string;
+}
+
+const SUMMARY_MAX_FILES = 128;
+const SUMMARY_MAX_BYTES = 16 * 1024 * 1024;
+const SUMMARY_OWNER_FILE = ".clawsweeper-output-owner";
+export const TRANSIENT_REVIEW_OUTPUT_MAX_FILES = 256;
+export const TRANSIENT_REVIEW_OUTPUT_MAX_BYTES = 96 * 1024 * 1024;
+export const TRANSIENT_REVIEW_STREAM_MAX_BYTES = 16 * 1024 * 1024;
+export const TRANSIENT_REVIEW_RESULT_MAX_BYTES = 4 * 1024 * 1024;
+export const TRANSIENT_REVIEW_REPORTS_MAX_BYTES = 16 * 1024 * 1024;
+export const DEBUG_REVIEW_OUTPUT_MAX_FILES = 4096;
+export const DEBUG_REVIEW_OUTPUT_MAX_BYTES = 1024 * 1024 * 1024;
+const REVIEW_OUTPUT_MAX_ITEMS = 128;
+const DEBUG_REVIEW_STREAM_POOL_BYTES = 480 * 1024 * 1024;
+const DEBUG_REVIEW_PROMPT_POOL_BYTES = 256 * 1024 * 1024;
+const DEBUG_REVIEW_RESULT_POOL_BYTES = 64 * 1024 * 1024;
+const DEBUG_REVIEW_REPORTS_MAX_BYTES = 64 * 1024 * 1024;
+const PRIVATE_REVIEW_STREAM_POOL_BYTES = 32 * 1024 * 1024;
+const PRIVATE_REVIEW_RESULT_POOL_BYTES = 4 * 1024 * 1024;
+const PRIVATE_REVIEW_MEDIA_DOWNLOAD_BYTES = 32 * 1024 * 1024;
+const PRIVATE_REVIEW_MEDIA_DERIVED_BYTES = 8 * 1024 * 1024;
+const PRIVATE_REVIEW_METADATA_BYTES = 4 * 1024 * 1024;
+const REVIEW_OUTPUT_GLOBAL_MAX_FILES = 7;
+const REVIEW_OUTPUT_SUMMARY_OWNER_FILES = 1;
+const REVIEW_OUTPUT_PRIVATE_ITEM_MAX_FILES = 20;
+const REVIEW_OUTPUT_DEBUG_ITEM_MAX_FILES = 21;
+
+export function reviewOutputSelection(
+  args: Args,
+  options: {
+    destinationFlag: "artifact_dir" | "report_dir";
+    hostedEvidenceRequired?: boolean;
+  },
+): ReviewOutputSelection {
+  const requestedRetention = stringArg(args.output_retention, "").trim();
+  const explicitDestination = stringArg(args[options.destinationFlag], "").trim().length > 0;
+  const compatibilityRetention = !requestedRetention && explicitDestination;
+  const retention = compatibilityRetention ? "debug" : requestedRetention || "none";
+  if (!["none", "summary", "debug"].includes(retention)) {
+    throw new UserFacingCommandError(
+      `--output-retention must be one of: none, summary, debug (received ${JSON.stringify(retention)}).`,
+    );
+  }
+  if (retention === "none" && explicitDestination) {
+    throw new UserFacingCommandError(
+      `--output-retention none cannot be combined with --${options.destinationFlag.replaceAll("_", "-")}.`,
+    );
+  }
+  if (retention === "debug" && !explicitDestination) {
+    throw new UserFacingCommandError(
+      `--output-retention debug requires an explicit --${options.destinationFlag.replaceAll("_", "-")}.`,
+    );
+  }
+  if (options.hostedEvidenceRequired && retention !== "debug") {
+    throw new UserFacingCommandError(
+      "Hosted review requires --output-retention debug and an explicit --artifact-dir so required CI, security, and canonical publication evidence has a validated destination.",
+    );
+  }
+  if (options.hostedEvidenceRequired && !explicitDestination) {
+    throw new UserFacingCommandError(
+      "Hosted review requires an explicit --artifact-dir for required CI, security, and canonical publication evidence.",
+    );
+  }
+  const resultFormat = stringArg(args.result_format, "text").trim();
+  if (resultFormat !== "text" && resultFormat !== "json") {
+    throw new UserFacingCommandError(
+      `--result-format must be text or json (received ${JSON.stringify(resultFormat)}).`,
+    );
+  }
+  return {
+    retention: retention as ReviewOutputRetention,
+    resultFormat,
+    explicitDestination,
+    compatibilityRetention,
+  };
+}
+
+export function createTransientReviewOutput(
+  prefix: string,
+  owner?: TransientReviewOutput,
+): TransientReviewOutput {
+  const path = mkdtempSync(join(tmpdir(), prefix));
+  chmodSync(path, 0o700);
+  let cleaned = false;
+  const ownedCleanups: Array<() => void> = [];
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    for (const ownedCleanup of ownedCleanups.splice(0).reverse()) ownedCleanup();
+    rmSync(path, { recursive: true, force: true });
+  };
+  if (owner) owner.addCleanup(cleanup);
+  return {
+    path,
+    cleanup,
+    addCleanup: (ownedCleanup) => {
+      if (cleaned) ownedCleanup();
+      else ownedCleanups.push(ownedCleanup);
+    },
+  };
+}
+
+export function prepareRetainedReviewOutput(
+  path: string,
+  retention: Exclude<ReviewOutputRetention, "none">,
+): RetainedReviewOutput {
+  const destination = resolve(path);
+  if (retention === "summary") {
+    if (existsSync(destination)) {
+      throw new UserFacingCommandError(
+        `Summary output destination must not already exist: ${destination}`,
+      );
+    }
+    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+    try {
+      mkdirSync(destination, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new UserFacingCommandError(
+          `Summary output destination must be created exclusively: ${destination}`,
+        );
+      }
+      throw error;
+    }
+    const ownerToken = randomUUID();
+    try {
+      writeFileSync(join(destination, SUMMARY_OWNER_FILE), ownerToken, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+    } catch (error) {
+      rmSync(destination, { recursive: true, force: true });
+      throw error;
+    }
+    return { path: destination, retention, ownerToken };
+  }
+  if (existsSync(destination)) {
+    const metadata = lstatSync(destination);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new UserFacingCommandError(
+        `Review output destination must be a real directory: ${destination}`,
+      );
+    }
+  } else {
+    mkdirSync(destination, { recursive: true, mode: 0o700 });
+  }
+  chmodSync(destination, 0o700);
+  return { path: destination, retention, ownerToken: null };
+}
+
+export function finalizeSummaryReviewOutput(
+  output: RetainedReviewOutput,
+  retainedPaths: readonly string[],
+): void {
+  const destination = resolve(output.path);
+  assertSummaryOutputOwner(output);
+  const retained = new Set(
+    retainedPaths
+      .map((path) => resolve(path))
+      .filter((path) => path === destination || path.startsWith(`${destination}${sep}`)),
+  );
+  for (const name of readdirSync(destination)) {
+    if (name === SUMMARY_OWNER_FILE) continue;
+    const entry = join(destination, name);
+    const keep = [...retained].some((path) => path === entry || path.startsWith(`${entry}${sep}`));
+    if (!keep) rmSync(entry, { recursive: true, force: true });
+  }
+  let files = 0;
+  let bytes = 0;
+  for (const path of retained) {
+    if (!existsSync(path)) continue;
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      rmSync(destination, { recursive: true, force: true });
+      throw new UserFacingCommandError("Summary review output contained an unsafe file type.");
+    }
+    files += 1;
+    bytes += statSync(path).size;
+    chmodSync(path, 0o600);
+  }
+  if (files > SUMMARY_MAX_FILES || bytes > SUMMARY_MAX_BYTES) {
+    rmSync(destination, { recursive: true, force: true });
+    throw new UserFacingCommandError(
+      `Summary review output exceeded its ${SUMMARY_MAX_FILES}-file or ${SUMMARY_MAX_BYTES}-byte limit.`,
+    );
+  }
+  removeEmptyParents(retained, destination);
+  rmSync(join(destination, SUMMARY_OWNER_FILE), { force: true });
+  if (existsSync(destination) && readdirSync(destination).length === 0) {
+    rmdirSync(destination);
+  }
+}
+
+export function discardOwnedSummaryOutput(output: RetainedReviewOutput | null): void {
+  if (!output || output.retention !== "summary") return;
+  assertSummaryOutputOwner(output);
+  rmSync(output.path, { recursive: true, force: true });
+}
+
+export function assertTransientReviewOutputBudget(root: string): void {
+  reviewOutputInventory(resolve(root), {
+    maxFiles: TRANSIENT_REVIEW_OUTPUT_MAX_FILES,
+    maxBytes: TRANSIENT_REVIEW_OUTPUT_MAX_BYTES,
+  });
+}
+
+export function assertReviewReportsBudget(
+  results: readonly ReviewOutputResult[],
+  retention: ReviewOutputRetention,
+): void {
+  const bytes = results.reduce((total, result) => total + Buffer.byteLength(result.markdown), 0);
+  const maxBytes =
+    retention === "debug" ? DEBUG_REVIEW_REPORTS_MAX_BYTES : TRANSIENT_REVIEW_REPORTS_MAX_BYTES;
+  if (bytes > maxBytes) {
+    throw new UserFacingCommandError(`Review reports exceeded their ${maxBytes}-byte limit.`);
+  }
+}
+
+export function reviewOutputItemBudget(
+  retention: ReviewOutputRetention,
+  itemCount: number,
+): {
+  promptFileBytes: number;
+  resultFileBytes: number;
+  streamFileBytes: number;
+  threadStateBytes: number;
+  mediaDownloadBytes: number;
+  mediaDerivedBytes: number;
+  metadataBytes: number;
+  reportsBytes: number;
+} {
+  if (!Number.isInteger(itemCount) || itemCount < 1 || itemCount > REVIEW_OUTPUT_MAX_ITEMS) {
+    throw new UserFacingCommandError(
+      `Review output budgets support 1-${REVIEW_OUTPUT_MAX_ITEMS} items per invocation.`,
+    );
+  }
+  if (retention === "debug") {
+    return {
+      promptFileBytes: Math.floor(DEBUG_REVIEW_PROMPT_POOL_BYTES / itemCount),
+      resultFileBytes: Math.floor(DEBUG_REVIEW_RESULT_POOL_BYTES / itemCount),
+      streamFileBytes: Math.min(
+        128 * 1024 * 1024,
+        Math.floor(DEBUG_REVIEW_STREAM_POOL_BYTES / (itemCount * 2)),
+      ),
+      mediaDownloadBytes: 64 * 1024 * 1024,
+      threadStateBytes: CODEX_THREAD_STATE_MAX_BYTES,
+      mediaDerivedBytes: 16 * 1024 * 1024,
+      metadataBytes: PRIVATE_REVIEW_METADATA_BYTES,
+      reportsBytes: DEBUG_REVIEW_REPORTS_MAX_BYTES,
+    };
+  }
+  const budget = {
+    promptFileBytes: 0,
+    resultFileBytes: PRIVATE_REVIEW_RESULT_POOL_BYTES,
+    streamFileBytes: PRIVATE_REVIEW_STREAM_POOL_BYTES / 2,
+    threadStateBytes: CODEX_THREAD_STATE_MAX_BYTES,
+    mediaDownloadBytes: PRIVATE_REVIEW_MEDIA_DOWNLOAD_BYTES,
+    mediaDerivedBytes: PRIVATE_REVIEW_MEDIA_DERIVED_BYTES,
+    metadataBytes: PRIVATE_REVIEW_METADATA_BYTES - CODEX_THREAD_STATE_MAX_BYTES,
+    reportsBytes: TRANSIENT_REVIEW_REPORTS_MAX_BYTES,
+  };
+  const allocatedBytes =
+    budget.streamFileBytes * 2 +
+    budget.resultFileBytes +
+    budget.threadStateBytes +
+    budget.reportsBytes +
+    budget.mediaDownloadBytes +
+    budget.mediaDerivedBytes +
+    budget.metadataBytes;
+  if (allocatedBytes !== TRANSIENT_REVIEW_OUTPUT_MAX_BYTES) {
+    throw new Error("Transient review output component budgets do not match the run limit.");
+  }
+  return budget;
+}
+
+export interface ReviewOutputBudget {
+  readonly root: string;
+  readonly retention: ReviewOutputRetention;
+  item: ReturnType<typeof reviewOutputItemBudget>;
+  readonly maxBytes: number;
+  readonly maxFiles: number;
+  mediaMaxBytes: number;
+  mediaMaxFiles: number;
+  readonly metadata: Map<string, number>;
+  readonly reports: Map<string, number>;
+  readonly mediaRoots: Set<string>;
+  readonly existing: Set<string>;
+  readonly modelFiles: Set<string>;
+}
+
+export function createReviewOutputBudget(
+  root: string,
+  retention: ReviewOutputRetention,
+  itemCount = 1,
+): ReviewOutputBudget {
+  const resolved = resolve(root);
+  const item = reviewOutputItemBudget(retention, itemCount);
+  const maxBytes =
+    retention === "debug" ? DEBUG_REVIEW_OUTPUT_MAX_BYTES : TRANSIENT_REVIEW_OUTPUT_MAX_BYTES;
+  const maxFiles =
+    retention === "debug" ? DEBUG_REVIEW_OUTPUT_MAX_FILES : TRANSIENT_REVIEW_OUTPUT_MAX_FILES;
+  // Existing debug destinations consume the run allowance too. Admission needs
+  // a complete inventory, including nested files and later replacements.
+  const existing = reviewOutputInventory(resolved, { maxBytes, maxFiles });
+  const budget: ReviewOutputBudget = {
+    root: resolved,
+    retention,
+    item,
+    maxBytes,
+    maxFiles,
+    mediaMaxBytes: 0,
+    mediaMaxFiles: 0,
+    metadata: new Map(),
+    reports: new Map(),
+    mediaRoots: new Set(),
+    existing: new Set(existing.keys()),
+    modelFiles: new Set(),
+  };
+  configureReviewOutputItems(budget, itemCount);
+  return budget;
+}
+
+export function configureReviewOutputItems(
+  budget: ReviewOutputBudget,
+  itemCount: number,
+): ReturnType<typeof reviewOutputItemBudget> {
+  const item = reviewOutputItemBudget(budget.retention, itemCount);
+  const liveItems = budget.retention === "debug" ? itemCount : 1;
+  const modelBytes =
+    liveItems *
+    (item.promptFileBytes +
+      item.resultFileBytes +
+      item.streamFileBytes * 2 +
+      item.threadStateBytes);
+  budget.item = item;
+  budget.mediaMaxBytes = Math.max(
+    0,
+    budget.maxBytes - modelBytes - item.metadataBytes - item.reportsBytes,
+  );
+  budget.mediaMaxFiles = Math.max(
+    0,
+    budget.maxFiles -
+      REVIEW_OUTPUT_GLOBAL_MAX_FILES -
+      (budget.retention === "debug" ? itemCount * 7 : 5 + itemCount),
+  );
+  return item;
+}
+
+export function writeReviewOutput(
+  budget: ReviewOutputBudget,
+  path: string,
+  content: string,
+  kind: "metadata" | "report" = "metadata",
+): void {
+  const destination = assertOwnedOutputPath(budget.root, path);
+  const inventory = reviewOutputInventory(budget.root, budget);
+  const totals = outputInventoryTotals(inventory);
+  const bytes = Buffer.byteLength(content);
+  const pool = kind === "metadata" ? budget.metadata : budget.reports;
+  const limit = kind === "metadata" ? budget.item.metadataBytes : budget.item.reportsBytes;
+  const retained = [...pool].reduce(
+    (sum, [entry]) => sum + (entry === destination ? 0 : (inventory.get(entry) ?? 0)),
+    0,
+  );
+  if (bytes > limit - retained) {
+    throw new UserFacingCommandError(`Review ${kind} exceeded its ${limit}-byte limit.`);
+  }
+  assertOutputAdmission(
+    budget,
+    totals.bytes - (inventory.get(destination) ?? 0) + bytes,
+    totals.files + (inventory.has(destination) ? 0 : 1),
+  );
+  writeFileSync(destination, content, { encoding: "utf8", mode: 0o600 });
+  pool.set(destination, bytes);
+}
+
+export function reviewOutputMediaLimits(
+  budget: ReviewOutputBudget,
+  root: string,
+): {
+  downloadBytes: number;
+  derivedBytes: number;
+  metadataBytes: number;
+  files: number;
+} {
+  const destination = assertOwnedOutputPath(budget.root, root);
+  budget.mediaRoots.add(destination);
+  const inventory = reviewOutputInventory(budget.root, budget);
+  const totals = outputInventoryTotals(inventory);
+  assertOutputAdmission(budget, totals.bytes, totals.files);
+  let mediaBytes = 0;
+  let mediaFiles = 0;
+  let existingBytes = 0;
+  let existingFiles = 0;
+  for (const [path, bytes] of inventory) {
+    if (![...budget.mediaRoots].some((mediaRoot) => path.startsWith(`${mediaRoot}${sep}`))) {
+      if (
+        budget.existing.has(path) &&
+        !budget.metadata.has(path) &&
+        !budget.reports.has(path) &&
+        !budget.modelFiles.has(path)
+      ) {
+        existingBytes += bytes;
+        existingFiles += 1;
+      }
+      continue;
+    }
+    mediaFiles += 1;
+    if (!budget.metadata.has(path)) mediaBytes += bytes;
+  }
+  // Preserve the non-media pools before admitting another download/transcode.
+  // Limits describe retained managed output, not a disk quota for child processes.
+  const remaining = Math.max(
+    0,
+    Math.min(budget.mediaMaxBytes - existingBytes - mediaBytes, budget.maxBytes - totals.bytes),
+  );
+  const downloadBytes = Math.min(budget.item.mediaDownloadBytes, Math.floor(remaining * 0.8));
+  return {
+    downloadBytes,
+    derivedBytes: Math.min(budget.item.mediaDerivedBytes, remaining - downloadBytes),
+    metadataBytes: Math.max(
+      0,
+      budget.item.metadataBytes -
+        [...budget.metadata.keys()].reduce((sum, path) => sum + (inventory.get(path) ?? 0), 0),
+    ),
+    files: Math.max(
+      0,
+      Math.min(budget.mediaMaxFiles - existingFiles - mediaFiles, budget.maxFiles - totals.files),
+    ),
+  };
+}
+
+export function produceReviewOutput<T>(
+  budget: ReviewOutputBudget,
+  allowance: { paths: readonly string[]; maxBytes: number; maxFiles: number; metadata?: boolean },
+  produce: () => T,
+): T {
+  const paths = allowance.paths.map((path) => assertOwnedOutputPath(budget.root, path));
+  const inventory = reviewOutputInventory(budget.root, budget);
+  const totals = outputInventoryTotals(inventory);
+  const replaces = (path: string) =>
+    paths.some((entry) => path === entry || path.startsWith(`${entry}${sep}`));
+  let replacedBytes = 0;
+  let replacedFiles = 0;
+  for (const [path, bytes] of inventory) {
+    if (replaces(path)) {
+      replacedBytes += bytes;
+      replacedFiles += 1;
+    }
+  }
+  assertOutputAdmission(
+    budget,
+    totals.bytes - replacedBytes + allowance.maxBytes,
+    totals.files - replacedFiles + allowance.maxFiles,
+  );
+  if (allowance.metadata) {
+    const retained = [...budget.metadata.keys()].reduce(
+      (sum, path) => sum + (replaces(path) ? 0 : (inventory.get(path) ?? 0)),
+      0,
+    );
+    if (allowance.maxBytes > budget.item.metadataBytes - retained) {
+      throw new UserFacingCommandError("Review failure diagnostics exceeded the metadata limit.");
+    }
+  }
+  try {
+    return produce();
+  } finally {
+    const actual = reviewOutputInventory(budget.root, budget);
+    for (const [path, bytes] of actual) {
+      if (!replaces(path)) continue;
+      if (allowance.metadata) budget.metadata.set(path, bytes);
+      else budget.modelFiles.add(path);
+    }
+    const totals = outputInventoryTotals(actual);
+    assertOutputAdmission(budget, totals.bytes, totals.files);
+  }
+}
+
+function assertOutputAdmission(
+  budget: Pick<ReviewOutputBudget, "maxBytes" | "maxFiles">,
+  bytes: number,
+  files: number,
+): void {
+  if (bytes > budget.maxBytes || files > budget.maxFiles) {
+    throw new UserFacingCommandError(
+      `Review output exceeded its ${budget.maxFiles}-file or ${budget.maxBytes}-byte limit.`,
+    );
+  }
+}
+
+function reviewOutputInventory(
+  root: string,
+  limits: Pick<ReviewOutputBudget, "maxBytes" | "maxFiles">,
+): Map<string, number> {
+  const files = new Map<string, number>();
+  let bytes = 0;
+  const pending = [root];
+  while (pending.length) {
+    const directory = pending.pop()!;
+    for (const name of readdirSync(directory)) {
+      const path = join(directory, name);
+      const metadata = lstatSync(path);
+      if (metadata.isDirectory()) pending.push(path);
+      else if (metadata.isFile()) {
+        bytes += metadata.size;
+        assertOutputAdmission(limits, bytes, files.size + 1);
+        files.set(path, metadata.size);
+      } else throw new UserFacingCommandError("Review output contained an unsafe file type.");
+    }
+  }
+  return files;
+}
+
+function outputInventoryTotals(inventory: ReadonlyMap<string, number>): {
+  bytes: number;
+  files: number;
+} {
+  return {
+    bytes: [...inventory.values()].reduce((sum, bytes) => sum + bytes, 0),
+    files: inventory.size,
+  };
+}
+
+export function reviewOutputFilePeak(retention: ReviewOutputRetention, itemCount: number): number {
+  if (!Number.isInteger(itemCount) || itemCount < 1 || itemCount > REVIEW_OUTPUT_MAX_ITEMS) {
+    throw new UserFacingCommandError(
+      `Review output budgets support 1-${REVIEW_OUTPUT_MAX_ITEMS} items per invocation.`,
+    );
+  }
+  if (retention === "debug") {
+    return REVIEW_OUTPUT_GLOBAL_MAX_FILES + REVIEW_OUTPUT_DEBUG_ITEM_MAX_FILES * itemCount;
+  }
+  if (retention === "summary") {
+    return (
+      REVIEW_OUTPUT_GLOBAL_MAX_FILES +
+      REVIEW_OUTPUT_SUMMARY_OWNER_FILES +
+      REVIEW_OUTPUT_PRIVATE_ITEM_MAX_FILES +
+      itemCount -
+      1
+    );
+  }
+  return REVIEW_OUTPUT_GLOBAL_MAX_FILES + REVIEW_OUTPUT_PRIVATE_ITEM_MAX_FILES;
+}
+
+export function assertReviewOutputFilePeak(
+  retention: ReviewOutputRetention,
+  itemCount: number,
+): void {
+  const peak = reviewOutputFilePeak(retention, itemCount);
+  const maxFiles =
+    retention === "debug" ? DEBUG_REVIEW_OUTPUT_MAX_FILES : TRANSIENT_REVIEW_OUTPUT_MAX_FILES;
+  if (peak > maxFiles) {
+    throw new UserFacingCommandError(
+      `${retention === "debug" ? "Debug" : "Transient"} review output can require ${peak} live files, exceeding its ${maxFiles}-file limit.`,
+    );
+  }
+}
+
+export function pruneReviewOutputItem(options: {
+  artifactDir: string;
+  codexWorkDir: string;
+  proofScratchDir: string;
+  reportPath: string;
+  itemNumber: number;
+  retention: ReviewOutputRetention;
+}): void {
+  if (options.retention === "debug") return;
+  const artifactDir = resolve(options.artifactDir);
+  const codexWorkDir = assertOwnedOutputPath(artifactDir, options.codexWorkDir);
+  const proofScratchDir = assertOwnedOutputPath(artifactDir, options.proofScratchDir);
+  const reportPath = assertOwnedOutputPath(artifactDir, options.reportPath);
+  const itemPrefix = join(codexWorkDir, String(options.itemNumber));
+  for (const path of [
+    `${itemPrefix}.prompt.md`,
+    `${itemPrefix}.json`,
+    `${itemPrefix}.1.codex.stdout.log`,
+    `${itemPrefix}.1.codex.stderr.log`,
+    `${itemPrefix}.review-thread.json`,
+  ]) {
+    rmSync(path, { force: true });
+  }
+  rmSync(proofScratchDir, { recursive: true, force: true });
+  if (options.retention === "none") rmSync(reportPath, { force: true });
+  removeDirectoryIfEmpty(dirname(proofScratchDir));
+  removeDirectoryIfEmpty(codexWorkDir);
+}
+
+export function assertActiveReviewOutputBudget(output: RetainedReviewOutput): void {
+  const maxFiles =
+    output.retention === "debug"
+      ? DEBUG_REVIEW_OUTPUT_MAX_FILES
+      : TRANSIENT_REVIEW_OUTPUT_MAX_FILES;
+  const maxBytes =
+    output.retention === "debug"
+      ? DEBUG_REVIEW_OUTPUT_MAX_BYTES
+      : TRANSIENT_REVIEW_OUTPUT_MAX_BYTES;
+  reviewOutputInventory(output.path, { maxFiles, maxBytes });
+}
+
+export function readBoundedReviewResult(path: string, maxBytes: number): string {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new UserFacingCommandError("Review result output was not a regular file.");
+  }
+  if (metadata.size > maxBytes) {
+    throw new UserFacingCommandError(`Review result output exceeded its ${maxBytes}-byte limit.`);
+  }
+  return readFileSync(path, "utf8");
+}
+
+export function emitReviewOutput(
+  selection: ReviewOutputSelection,
+  status: "completed" | "failed",
+  results: readonly ReviewOutputResult[],
+): void {
+  if (selection.resultFormat === "json") {
+    console.log(
+      JSON.stringify({
+        status,
+        retention: selection.retention,
+        reports: results.map((result) => ({
+          ...(result.itemNumber === undefined ? {} : { item_number: result.itemNumber }),
+          artifact_path: result.path,
+          report: result.markdown,
+        })),
+      }),
+    );
+    return;
+  }
+  for (const result of results) {
+    console.log(
+      selection.compatibilityRetention && result.path ? result.path : result.markdown.trimEnd(),
+    );
+  }
+}
+
+export function emitReviewFailureJson(args: Args, error: unknown): boolean {
+  if (stringArg(args.result_format, "text").trim() !== "json") return false;
+  const requestedRetention = stringArg(args.output_retention, "").trim();
+  const compatibilityRetention =
+    !requestedRetention &&
+    [stringArg(args.artifact_dir, ""), stringArg(args.report_dir, "")].some(
+      (path) => path.trim().length > 0,
+    );
+  console.log(
+    JSON.stringify({
+      status: "failed",
+      retention: compatibilityRetention
+        ? "debug"
+        : ["none", "summary", "debug"].includes(requestedRetention)
+          ? requestedRetention
+          : "none",
+      reports: [],
+      error: {
+        message: error instanceof Error ? error.message : String(error),
+      },
+    }),
+  );
+  return true;
+}
+
+function removeEmptyParents(retained: ReadonlySet<string>, root: string): void {
+  const parents = new Set<string>();
+  for (const path of retained) {
+    let current = dirname(path);
+    while (current.startsWith(`${root}${sep}`)) {
+      parents.add(current);
+      current = dirname(current);
+    }
+  }
+  for (const path of [...parents].sort((left, right) => right.length - left.length)) {
+    if (existsSync(path) && readdirSync(path).length === 0) rmSync(path, { recursive: true });
+  }
+}
+
+function assertOwnedOutputPath(root: string, path: string): string {
+  const candidate = resolve(path);
+  if (candidate === root || !candidate.startsWith(`${root}${sep}`)) {
+    throw new UserFacingCommandError("Review output cleanup refused a path outside its run.");
+  }
+  return candidate;
+}
+
+function removeDirectoryIfEmpty(path: string): void {
+  if (existsSync(path) && readdirSync(path).length === 0) rmdirSync(path);
+}
+
+function assertSummaryOutputOwner(output: RetainedReviewOutput): void {
+  const destination = resolve(output.path);
+  if (output.retention !== "summary" || !output.ownerToken) {
+    throw new UserFacingCommandError("Summary output finalization requires its owner token.");
+  }
+  const metadata = lstatSync(destination);
+  const marker = join(destination, SUMMARY_OWNER_FILE);
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isDirectory() ||
+    !existsSync(marker) ||
+    lstatSync(marker).isSymbolicLink() ||
+    readFileSync(marker, "utf8") !== output.ownerToken
+  ) {
+    throw new UserFacingCommandError("Summary output ownership changed before finalization.");
+  }
+}

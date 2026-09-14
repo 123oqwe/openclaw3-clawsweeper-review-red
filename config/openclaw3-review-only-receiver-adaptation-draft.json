@@ -1,0 +1,38 @@
+{
+  "status": "unwired-draft",
+  "sourcePin": "openclaw/clawsweeper@16505cf0358d70341e1c8d0135d648e2f69b896c",
+  "purpose": "Map the existing manual record/comment-only route to a future isolated receiver. This file is not read by upstream runtime code and cannot authorize deployment.",
+  "approvedTargetRequired": "<approval-required: one newly created sandbox repository; never 123oqwe/openclaw3.0 during first integration>",
+  "actualUpstreamConsumers": [
+    {
+      "path": "config/target-repositories.json",
+      "consumer": "src/repository-profiles.ts and .github/workflows/hosted-target-admission.yml",
+      "requiredForkChange": "Add exactly one explicit sandbox target profile with apply_close_rules.issue and apply_close_rules.pull_request both empty. Do not add a generic 123oqwe fallback or dashboard inventory membership."
+    },
+    {
+      "path": ".github/workflows/hosted-target-admission.yml",
+      "consumer": "sweep.yml hosted-target-admission job",
+      "requiredForkChange": "Fetch the pinned receiver's own target registry rather than openclaw/clawsweeper, use the self-owned App client ID, and admit only the explicit sandbox profile."
+    },
+    {
+      "path": ".github/workflows/sweep.yml:4862-4867",
+      "consumer": "manual-review-enqueue -> ExactReviewQueue /enqueue",
+      "requiredForkChange": "Retain workflow_dispatch exact item selection and only the durable queue repository_dispatch type required for its receipt. Require manual_explicit plus queue decision sourceAction=manual_explicit_review and publicationPolicy=record_comment_only before review. Remove all schedule entries, target-sweep/generic event intake, apply inputs/jobs, planning fanout, and every route that can select plan/apply/repair behavior."
+    },
+    {
+      "path": "dashboard/exact-review-queue.ts:1727-1733,4971-4975",
+      "consumer": "Durable ExactReviewQueue",
+      "requiredForkChange": "Set EXACT_REVIEW_MANUAL_PUBLICATION_ENABLED=1 only after the compatible review-only consumer and publisher are deployed and Hosted-tested; it makes manual admission advertise and enforce record_comment_only."
+    },
+    {
+      "path": ".github/workflows/sweep.yml:4995-5022,5372-5391",
+      "consumer": "review executor and publisher",
+      "requiredForkChange": "Keep model executor token read-only. Replace stock publisher token (contents/issues/pull-requests write) with the narrow comment-only call path and prove by Hosted test that Issues:write alone publishes the PR issue comment; otherwise stop rather than grant Contents:write. Keep App key/HMAC inaccessible to model job."
+    }
+  ],
+  "nonGoals": [
+    "No target dispatcher, webhook event intake, schedule, generic owner fallback, dashboard, state projection repository, apply target, repair, close, label, push, merge, or automatic onboarding.",
+    "No claim that a JSON false value disables a stock workflow path."
+  ],
+  "acceptance": "The future receiver patch must first produce Hosted RED against a real entrypoint for each prohibited route and then Hosted GREEN. Until then this is a mapping draft only."
+}

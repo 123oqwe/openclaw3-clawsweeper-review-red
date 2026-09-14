@@ -1,0 +1,42 @@
+name: Create ClawSweeper state token
+description: Mint a GitHub App token for the generated state repository.
+inputs:
+  client-id:
+    description: GitHub App client ID.
+    required: true
+  private-key:
+    description: GitHub App private key.
+    required: true
+  owner:
+    description: State repository owner.
+    required: false
+    default: openclaw
+  repository:
+    description: State repository name.
+    required: false
+    default: clawsweeper-state
+  contents-permission:
+    description: Contents permission for the state repository token (read or write).
+    required: false
+    default: write
+  actions-permission:
+    description: Actions permission for the state repository token (read or write).
+    required: false
+    default: write
+outputs:
+  token:
+    description: GitHub App installation token for the state repository.
+    value: ${{ steps.state-token.outputs.token }}
+runs:
+  using: composite
+  steps:
+    - name: Create state repository token
+      id: state-token
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: ${{ inputs.client-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ inputs.owner }}
+        repositories: ${{ inputs.repository }}
+        permission-actions: ${{ inputs.actions-permission }}
+        permission-contents: ${{ inputs.contents-permission }}

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "openclaw/clawsweeper",
+    "commit": "16505cf0358d70341e1c8d0135d648e2f69b896c"
+  },
+  "target": {
+    "repository": "<approval-required: 123oqwe/openclaw3-clawsweeper-sandbox>",
+    "branch": "<approval-required: main>"
+  },
+  "review": {
+    "trigger": "manual_exact_review",
+    "publicationPolicy": "record_comment_only",
+    "manualPublicationEnabled": true,
+    "applyExisting": false,
+    "applyAfterReview": false,
+    "scheduledIntake": false,
+    "automaticClose": false
+  },
+  "identity": {
+    "officialDefaultLogin": "clawsweeper[bot]",
+    "officialDefaultId": 274271284,
+    "replacementRequiresPairedLoginAndId": true
+  },
+  "externalResources": {
+    "receiverRepository": "<approval-required: 123oqwe/openclaw3-clawsweeper-review>",
+    "githubAppSlug": "<approval-required: openclaw3-clawsweeper-review>",
+    "cloudflareWorker": "<approval-required: openclaw3-clawsweeper-review>",
+    "durableObjectNamespace": "<approval-required: openclaw3-clawsweeper-review>",
+    "r2Bucket": "<approval-required: openclaw3-clawsweeper-review-state>",
+    "exactReviewQueueUrl": "<approval-required: https://openclaw3-clawsweeper-review.<account>.workers.dev>",
+    "stateProjectionRepository": "not-created; only add if the upstream control plane requires it"
+  }
+}

@@ -1,0 +1,87 @@
+name: Setup pnpm workspace
+description: Setup Node, install pnpm dependencies, and optionally run a build script.
+inputs:
+  node-version:
+    description: Node.js version.
+    default: "24"
+  pnpm-version:
+    description: pnpm version to activate through Corepack.
+    default: "12.4.1"
+  working-directory:
+    description: Directory containing package.json.
+    default: "."
+  build-script:
+    description: Optional pnpm script to run after install.
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Enable pinned pnpm
+      shell: bash
+      run: |
+        set -euo pipefail
+        corepack enable
+        for attempt in 1 2 3; do
+          if corepack prepare "pnpm@${{ inputs.pnpm-version }}" --activate; then
+            exit 0
+          fi
+          sleep "$((attempt * 10))"
+        done
+        corepack prepare "pnpm@${{ inputs.pnpm-version }}" --activate
+
+    - name: Resolve pnpm store
+      id: pnpm-store
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+    - name: Resolve pnpm cache key
+      id: pnpm-cache-key
+      shell: bash
+      run: |
+        set -euo pipefail
+        lockfile="${{ inputs.working-directory }}/pnpm-lock.yaml"
+        if [ -f "$lockfile" ]; then
+          lock_hash="$(git hash-object "$lockfile")"
+        else
+          lock_hash="no-lockfile"
+        fi
+        workspace="${{ inputs.working-directory }}/pnpm-workspace.yaml"
+        if [ -f "$workspace" ]; then
+          policy_hash="$(git hash-object "$workspace")"
+        else
+          policy_hash="no-workspace"
+        fi
+        {
+          echo "key=${RUNNER_OS:-unknown}-pnpm-${{ inputs.pnpm-version }}-$policy_hash-$lock_hash"
+          echo "restore_key=${RUNNER_OS:-unknown}-pnpm-${{ inputs.pnpm-version }}-$policy_hash-"
+        } >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@v6
+      with:
+        path: ${{ steps.pnpm-store.outputs.path }}
+        key: ${{ steps.pnpm-cache-key.outputs.key }}
+        restore-keys: |
+          ${{ steps.pnpm-cache-key.outputs.restore_key }}
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        for attempt in 1 2 3; do
+          if pnpm install --frozen-lockfile; then
+            break
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            exit 1
+          fi
+          sleep "$((attempt * 10))"
+        done
+        if [[ -n "${{ inputs.build-script }}" ]]; then
+          pnpm run "${{ inputs.build-script }}"
+        fi

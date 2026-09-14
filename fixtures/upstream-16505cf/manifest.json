@@ -1,0 +1,8 @@
+{
+  "source": "https://github.com/openclaw/clawsweeper.git",
+  "commit": "16505cf0358d70341e1c8d0135d648e2f69b896c",
+  "files": {
+    ".github/workflows/sweep.yml": "361f0f2bc947a8e33e1f5f5dc65f8533cce3ad0274d4fea7a6f48c2b08945ff8",
+    ".github/workflows/hosted-target-admission.yml": "c8da999a1698b66279a023b91c4b55d84636f9a9603c0309f829ff9f1c1d1f23"
+  }
+}

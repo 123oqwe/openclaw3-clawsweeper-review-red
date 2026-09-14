@@ -1,0 +1,29 @@
+name: Review-only contract RED
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract-red:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build existing runtime dependencies for behavioral baseline
+        run: pnpm run build:node
+      - name: Run planner-owned signed intake integration baseline
+        run: node --test test/repair/openclaw3-review-only-intake.test.ts
+      - name: Run planner-owned receiver contract RED
+        run: node --test test/openclaw3-review-only-receiver-entrypoints.test.ts

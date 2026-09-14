@@ -1,0 +1,778 @@
+import { createHmac } from "node:crypto";
+import {
+  ExactReviewBatchQueueTransportError,
+  responseErrorCode,
+  type TransportFailureReason,
+} from "./exact-review-queue-transport-error.js";
+
+import type {
+  ExactReviewBatchCompletion,
+  ExactReviewBatchMember,
+} from "./exact-review-batch-publisher.js";
+import type { StateWriterOperation, StateWriterProgress } from "../state-writer-telemetry.js";
+
+export type ExactReviewBatchQueueItem = ExactReviewBatchMember & {
+  decision: unknown;
+  repeatRevision?: boolean;
+};
+
+export type ExactReviewGithubRateLimitObservation = {
+  scope: "repository_actions" | "target_app";
+  targetOwner?: string;
+  observedAt: string;
+  retryAt: string;
+  provenance: "retry_after" | "rate_limit_reset" | "rate_limit_status" | "fallback";
+  authoritative: boolean;
+};
+
+export type ExactReviewGithubRequestMetric = {
+  scope: "repository_actions" | "target_app";
+  category:
+    | "artifact_download"
+    | "rate_status"
+    | "comments"
+    | "labels"
+    | "reviews"
+    | "workflow_dispatch"
+    | "item_metadata"
+    | "other";
+  mode: "read" | "mutation_or_private_read";
+  outcome: "success" | "throttle" | "transient" | "error" | "skipped_by_circuit";
+  repeatRevision: boolean;
+  count: number;
+};
+
+export type ExactReviewBatchLease = {
+  batchId: string;
+  leaseOwner: string;
+  leaseExpiresAt: string;
+  serverTime?: string;
+  items: ExactReviewBatchMember[];
+};
+
+export type ExactReviewBatchClaim = ExactReviewBatchLease & {
+  configuredBatchSize: number;
+  batchWaitMs: number;
+};
+
+export type ExactReviewBatchObservationStage =
+  | "preparation_started"
+  | "preparation_finished"
+  | "final_github_apply"
+  | "github_throttle";
+
+export type ExactReviewBatchFetch = {
+  batch: ExactReviewBatchLease;
+  items: ExactReviewBatchQueueItem[];
+  superseded: number;
+};
+
+type ExactReviewPublicationAcknowledgementState =
+  | "not_required"
+  | "pending"
+  | "observed"
+  | `skipped_${"locked" | "missing_comment"}`
+  | "unavailable";
+type ExactReviewPublicationAcknowledgementUnavailableReason =
+  | "projection_missing"
+  | "projection_not_command"
+  | "marker_mismatch"
+  | "comment_mismatch"
+  | "acknowledgement_not_required"
+  | "lifecycle_requeued"
+  | "terminal_missing"
+  | "routed_receipts_incomplete";
+type ExactReviewPublicationSuccessorFenceState =
+  | "verified"
+  | "missing"
+  | "ambiguous"
+  | "admission_missing"
+  | "admission_command_mismatch"
+  | "admission_marker_mismatch"
+  | "admission_comment_mismatch";
+
+export type ExactReviewPublicationReconcileSample = {
+  itemKey: string;
+  queueRevision: number;
+  reason:
+    | "stale_revision"
+    | "duplicate_lineage"
+    | "legacy_terminal"
+    | "legacy_state_batch_terminal";
+  targetKey: string;
+  publicationRevision: number | null;
+  supersededByRevision: number | null;
+  lineageClaimGeneration: number | null;
+  retainedItemKey: string | null;
+  commandContext: boolean;
+  acknowledgementState: ExactReviewPublicationAcknowledgementState;
+  acknowledgementUnavailableReason: ExactReviewPublicationAcknowledgementUnavailableReason | null;
+  successorFenceState: ExactReviewPublicationSuccessorFenceState | null;
+  supersedeSafe: boolean;
+  producerRunId?: string;
+  producerRunAttempt?: number;
+};
+
+export type ExactReviewPublicationReconcileResult = {
+  apply: boolean;
+  scanned: number;
+  legacyTerminalScanned: number;
+  eligible: number;
+  changed: number;
+  eligibleRemaining: number;
+  staleRevisionEligible: number;
+  staleRevisionChanged: number;
+  lineageDuplicateEligible: number;
+  lineageDuplicateChanged: number;
+  lineageRefreshed: number;
+  legacyTerminalCandidates: number;
+  legacyTerminalSelected: number;
+  legacyTerminalEligible: number;
+  legacyTerminalChanged: number;
+  legacyStateBatchTerminalCandidates: number;
+  legacyStateBatchTerminalSelected: number;
+  legacyStateBatchTerminalProducerSucceeded: number;
+  legacyStateBatchTerminalEligible: number;
+  legacyStateBatchTerminalChanged: number;
+  protectedBatchItems: number;
+  protectedLineageItems: number;
+  oldestEligibleAgeSeconds: number | null;
+  oldestRemainingAgeSeconds: number | null;
+  sample: ExactReviewPublicationReconcileSample[];
+};
+
+export interface ExactReviewBatchQueue {
+  claim(input: {
+    claimId: string;
+    leaseOwner: string;
+    maxItems: number;
+    dispatch?: { id: string; at: string };
+    runner?: { runId: string; runAttempt: number; startedAt: string };
+  }): Promise<ExactReviewBatchClaim | null>;
+  fetch(input: { batchId: string; leaseOwner: string }): Promise<ExactReviewBatchFetch>;
+  heartbeat(input: {
+    batchId: string;
+    leaseOwner: string;
+    leaseExpiresAt: string;
+    leaseRemainingMs?: number;
+    items: readonly ExactReviewBatchMember[];
+    stateWriterProgress?: StateWriterProgress;
+    observation?: { stage: ExactReviewBatchObservationStage; observedAt: string };
+  }): Promise<ExactReviewBatchLease>;
+  complete(input: {
+    batchId: string;
+    leaseOwner: string;
+    items: readonly ExactReviewBatchCompletion[];
+    stateCommitSha?: string;
+    failureFingerprint?: string;
+    stateWriter?: StateWriterOperation;
+    rateLimitObservations?: readonly ExactReviewGithubRateLimitObservation[];
+    requestMetrics?: readonly ExactReviewGithubRequestMetric[];
+    telemetryId?: string;
+  }): Promise<{
+    accepted: number;
+    skipped: number;
+    telemetryAccepted: boolean;
+    batch: ExactReviewBatchLease;
+  }>;
+}
+
+type QueueClientOptions = {
+  baseUrl: string;
+  webhookSecret: string;
+  fetch?: typeof globalThis.fetch;
+};
+
+const POST_EFFECT_ROUTES = {
+  enqueue: "/internal/exact-review/enqueue",
+  "router-receipt": "/internal/exact-review/lifecycle/router-receipt",
+  "terminal-disposition": "/internal/exact-review/lifecycle/terminal-disposition",
+} as const;
+
+export type ExactReviewBatchPostEffectRoute = keyof typeof POST_EFFECT_ROUTES;
+
+const REQUEST_TIMEOUT_MS = 20_000;
+const RETRY_DEADLINE_MS = 45_000;
+const MAX_ATTEMPTS = 3;
+const MAX_RETRY_AFTER_MS = 10_000;
+const RECONCILIATION_SAMPLE_LIMIT = 20;
+const RECONCILIATION_REASONS = new Set<ExactReviewPublicationReconcileSample["reason"]>([
+  "stale_revision",
+  "duplicate_lineage",
+  "legacy_terminal",
+  "legacy_state_batch_terminal",
+]);
+const ACKNOWLEDGEMENT_UNAVAILABLE_REASON =
+  /^(projection_missing|projection_not_command|marker_mismatch|comment_mismatch|acknowledgement_not_required|lifecycle_requeued|terminal_missing|routed_receipts_incomplete)$/;
+const SUCCESSOR_FENCE_STATE =
+  /^(verified|missing|ambiguous|admission_missing|admission_command_mismatch|admission_marker_mismatch|admission_comment_mismatch)$/;
+
+export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
+  private readonly baseUrl: string;
+  private readonly webhookSecret: string;
+  private readonly request: typeof globalThis.fetch;
+
+  constructor(options: QueueClientOptions) {
+    this.baseUrl = options.baseUrl.replace(/\/$/, "");
+    if (!this.baseUrl.startsWith("https://")) throw new Error("Batch queue URL must use HTTPS");
+    if (!options.webhookSecret) throw new Error("Batch queue webhook secret is required");
+    this.webhookSecret = options.webhookSecret;
+    this.request = options.fetch ?? globalThis.fetch;
+  }
+
+  async claim(input: {
+    claimId: string;
+    leaseOwner: string;
+    maxItems: number;
+    dispatch?: { id: string; at: string };
+    runner?: { runId: string; runAttempt: number; startedAt: string };
+  }) {
+    const response = await this.postUrl(
+      "/internal/exact-review/publication-batches/claim",
+      {
+        claim_id: input.claimId,
+        lease_owner: input.leaseOwner,
+        max_items: input.maxItems,
+        ...(input.dispatch
+          ? { dispatch_id: input.dispatch.id, dispatched_at: input.dispatch.at }
+          : {}),
+        ...(input.runner
+          ? {
+              runner_run_id: input.runner.runId,
+              runner_run_attempt: input.runner.runAttempt,
+              runner_started_at: input.runner.startedAt,
+            }
+          : {}),
+      },
+      input.dispatch ? Date.now() + RETRY_DEADLINE_MS : undefined,
+    );
+    if (response.claimed !== true) return null;
+    const batch = parseLease(response.batch);
+    const legacyConfiguredBatchSize =
+      response.effective_max_items !== undefined
+        ? positiveInteger(response.effective_max_items, "effective_max_items")
+        : input.maxItems;
+    return {
+      ...batch,
+      // During a rolling dashboard deploy, current-main workers advertise the cap
+      // under effective_max_items. On rollback, an older worker can return a lease
+      // created at a larger cap, so its membership is also a safe lower bound.
+      configuredBatchSize:
+        response.configured_batch_size !== undefined
+          ? positiveInteger(response.configured_batch_size, "configured_batch_size")
+          : Math.max(legacyConfiguredBatchSize, batch.items.length),
+      batchWaitMs: nonNegativeInteger(response.batch_wait_ms, "batch_wait_ms"),
+    };
+  }
+
+  async fetch(input: { batchId: string; leaseOwner: string }) {
+    const response = await this.post("fetch", {
+      batch_id: input.batchId,
+      lease_owner: input.leaseOwner,
+    });
+    const items = arrayValue(response.items).map(parseQueueItem);
+    return {
+      batch: parseLease(response.batch),
+      items,
+      superseded: nonNegativeInteger(response.superseded, "superseded"),
+    };
+  }
+
+  async heartbeat(input: {
+    batchId: string;
+    leaseOwner: string;
+    leaseExpiresAt: string;
+    leaseRemainingMs?: number;
+    items: readonly ExactReviewBatchMember[];
+    stateWriterProgress?: StateWriterProgress;
+    observation?: { stage: ExactReviewBatchObservationStage; observedAt: string };
+  }) {
+    const leaseExpiry = Date.parse(input.leaseExpiresAt);
+    if (!Number.isFinite(leaseExpiry)) throw new Error("Invalid batch lease expiry");
+    const now = Date.now();
+    const remaining = input.leaseRemainingMs ?? leaseExpiry - now;
+    if (!Number.isFinite(remaining)) throw new Error("Invalid batch lease remaining time");
+    const response = await this.postUrl(
+      "/internal/exact-review/publication-batches/heartbeat",
+      {
+        batch_id: input.batchId,
+        lease_owner: input.leaseOwner,
+        items: input.items.map((item) => ({
+          item_key: item.itemKey,
+          revision: item.revision,
+          claim_generation: item.claimGeneration,
+        })),
+        ...(input.stateWriterProgress ? { state_writer_progress: input.stateWriterProgress } : {}),
+        ...(input.observation
+          ? {
+              timeline_stage: input.observation.stage,
+              observed_at: input.observation.observedAt,
+            }
+          : {}),
+      },
+      now + Math.min(RETRY_DEADLINE_MS, remaining),
+    );
+    return parseLease(response.batch);
+  }
+
+  async postEffect(
+    route: ExactReviewBatchPostEffectRoute,
+    payload: string,
+    options: { retryLifecycle?: boolean } = {},
+  ) {
+    if (!Object.hasOwn(POST_EFFECT_ROUTES, route))
+      throw new Error("Invalid batch post-effect route");
+    // These lifecycle routes persist replay identity and preserve newer requeues.
+    // Publication enqueue still has no equivalent replay contract.
+    const lifecycle = route === "router-receipt" || route === "terminal-disposition";
+    const operation =
+      options.retryLifecycle === true && lifecycle ? objectValue(JSON.parse(payload)) : null;
+    const identity = operation?.[route === "router-receipt" ? "receipt_id" : "operation_id"];
+    const retryable =
+      typeof identity === "string" &&
+      identity.length > 0 &&
+      identity.length <= 300 &&
+      !/[\r\n]/.test(identity);
+    return this.postUrl(
+      POST_EFFECT_ROUTES[route],
+      payload,
+      retryable ? Date.now() + RETRY_DEADLINE_MS : undefined,
+    );
+  }
+
+  async enqueueScheduledReview(payload: string) {
+    return this.postUrl(POST_EFFECT_ROUTES.enqueue, payload, Date.now() + RETRY_DEADLINE_MS, true);
+  }
+
+  async reconcilePublications(input: { apply: boolean; maxItems: number }) {
+    const response = await this.postUrl("/internal/exact-review/publications/reconcile", {
+      apply: input.apply,
+      max_items: input.maxItems,
+    });
+    if (response.apply !== input.apply) throw new Error("Invalid batch queue reconciliation apply");
+    return {
+      apply: response.apply,
+      scanned: nonNegativeInteger(response.scanned, "scanned"),
+      legacyTerminalScanned: nonNegativeInteger(
+        response.legacy_terminal_scanned ?? 0,
+        "legacy_terminal_scanned",
+      ),
+      eligible: nonNegativeInteger(response.eligible, "eligible"),
+      changed: nonNegativeInteger(response.changed, "changed"),
+      eligibleRemaining: nonNegativeInteger(response.eligible_remaining, "eligible_remaining"),
+      staleRevisionEligible: nonNegativeInteger(
+        response.stale_revision_eligible ?? response.eligible,
+        "stale_revision_eligible",
+      ),
+      staleRevisionChanged: nonNegativeInteger(
+        response.stale_revision_changed ?? response.changed,
+        "stale_revision_changed",
+      ),
+      lineageDuplicateEligible: nonNegativeInteger(
+        response.lineage_duplicate_eligible ?? 0,
+        "lineage_duplicate_eligible",
+      ),
+      lineageDuplicateChanged: nonNegativeInteger(
+        response.lineage_duplicate_changed ?? 0,
+        "lineage_duplicate_changed",
+      ),
+      lineageRefreshed: nonNegativeInteger(response.lineage_refreshed ?? 0, "lineage_refreshed"),
+      legacyTerminalCandidates: nonNegativeInteger(
+        response.legacy_terminal_candidates ?? 0,
+        "legacy_terminal_candidates",
+      ),
+      legacyTerminalSelected: nonNegativeInteger(
+        response.legacy_terminal_selected ?? 0,
+        "legacy_terminal_selected",
+      ),
+      legacyTerminalEligible: nonNegativeInteger(
+        response.legacy_terminal_eligible ?? 0,
+        "legacy_terminal_eligible",
+      ),
+      legacyTerminalChanged: nonNegativeInteger(
+        response.legacy_terminal_changed ?? 0,
+        "legacy_terminal_changed",
+      ),
+      legacyStateBatchTerminalCandidates: nonNegativeInteger(
+        response.legacy_state_batch_terminal_candidates ?? 0,
+        "legacy_state_batch_terminal_candidates",
+      ),
+      legacyStateBatchTerminalSelected: nonNegativeInteger(
+        response.legacy_state_batch_terminal_selected ?? 0,
+        "legacy_state_batch_terminal_selected",
+      ),
+      legacyStateBatchTerminalProducerSucceeded: nonNegativeInteger(
+        response.legacy_state_batch_terminal_producer_succeeded ?? 0,
+        "legacy_state_batch_terminal_producer_succeeded",
+      ),
+      legacyStateBatchTerminalEligible: nonNegativeInteger(
+        response.legacy_state_batch_terminal_eligible ?? 0,
+        "legacy_state_batch_terminal_eligible",
+      ),
+      legacyStateBatchTerminalChanged: nonNegativeInteger(
+        response.legacy_state_batch_terminal_changed ?? 0,
+        "legacy_state_batch_terminal_changed",
+      ),
+      protectedBatchItems: nonNegativeInteger(
+        response.protected_batch_items,
+        "protected_batch_items",
+      ),
+      protectedLineageItems: nonNegativeInteger(
+        response.protected_lineage_items ?? 0,
+        "protected_lineage_items",
+      ),
+      oldestEligibleAgeSeconds: nullableNonNegativeInteger(
+        response.oldest_eligible_age_seconds,
+        "oldest_eligible_age_seconds",
+      ),
+      oldestRemainingAgeSeconds: nullableNonNegativeInteger(
+        response.oldest_remaining_age_seconds,
+        "oldest_remaining_age_seconds",
+      ),
+      sample: arrayValue(response.sample)
+        .slice(0, RECONCILIATION_SAMPLE_LIMIT)
+        .map(parseReconciliationSample),
+    } satisfies ExactReviewPublicationReconcileResult;
+  }
+
+  async complete(input: {
+    batchId: string;
+    leaseOwner: string;
+    items: readonly ExactReviewBatchCompletion[];
+    stateCommitSha?: string;
+    failureFingerprint?: string;
+    stateWriter?: StateWriterOperation;
+    rateLimitObservations?: readonly ExactReviewGithubRateLimitObservation[];
+    requestMetrics?: readonly ExactReviewGithubRequestMetric[];
+    telemetryId?: string;
+  }) {
+    const response = await this.post("complete", {
+      batch_id: input.batchId,
+      lease_owner: input.leaseOwner,
+      items: input.items.map((item) => ({
+        item_key: item.itemKey,
+        revision: item.revision,
+        claim_generation: item.claimGeneration,
+        terminal_outcome: item.terminalOutcome,
+        ...(item.reasonCode ? { reason_code: item.reasonCode } : {}),
+        ...(item.errorFingerprint ? { error_fingerprint: item.errorFingerprint } : {}),
+        ...(item.retryAt ? { retry_at: item.retryAt } : {}),
+        ...(item.attempted !== undefined ? { attempted: item.attempted } : {}),
+        ...(item.poolClass ? { pool_class: item.poolClass } : {}),
+      })),
+      ...(input.stateCommitSha ? { state_commit_sha: input.stateCommitSha } : {}),
+      ...(input.failureFingerprint ? { failure_fingerprint: input.failureFingerprint } : {}),
+      ...(input.stateWriter ? { state_writer: input.stateWriter } : {}),
+      ...(input.rateLimitObservations?.length
+        ? {
+            github_rate_limit_observations: input.rateLimitObservations.map((observation) => ({
+              scope: observation.scope,
+              ...(observation.targetOwner ? { target_owner: observation.targetOwner } : {}),
+              observed_at: observation.observedAt,
+              retry_at: observation.retryAt,
+              provenance: observation.provenance,
+              authoritative: observation.authoritative,
+            })),
+          }
+        : {}),
+      ...(input.requestMetrics?.length
+        ? {
+            github_request_metrics: input.requestMetrics.map((metric) => ({
+              scope: metric.scope,
+              category: metric.category,
+              mode: metric.mode,
+              outcome: metric.outcome,
+              repeat_revision: metric.repeatRevision,
+              count: metric.count,
+            })),
+          }
+        : {}),
+      ...(input.telemetryId ? { github_telemetry_id: input.telemetryId } : {}),
+    });
+    return {
+      accepted: nonNegativeInteger(response.accepted, "accepted"),
+      skipped: nonNegativeInteger(response.skipped, "skipped"),
+      telemetryAccepted: response.telemetry_accepted === true,
+      batch: parseLease(response.batch),
+    };
+  }
+
+  private async post(
+    path: string,
+    payload: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return this.postUrl(`/internal/exact-review/publication-batches/${path}`, payload);
+  }
+
+  private async postUrl(
+    path: string,
+    payload: Record<string, unknown> | string,
+    retryDeadline?: number,
+    rejectUnscopedRetriedDedupe = false,
+  ): Promise<Record<string, unknown>> {
+    // Serialize and sign once: receipt/delivery identity must survive ambiguous failures.
+    const body = typeof payload === "string" ? payload : JSON.stringify(payload);
+    const signature = `sha256=${createHmac("sha256", this.webhookSecret).update(body).digest("hex")}`;
+    const deadline = retryDeadline ?? Date.now() + REQUEST_TIMEOUT_MS;
+    const maxAttempts = retryDeadline === undefined ? 1 : MAX_ATTEMPTS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`Batch queue ${path} deadline expired`);
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => controller.abort(new DOMException("Batch queue request timeout", "TimeoutError")),
+        Math.min(REQUEST_TIMEOUT_MS, remaining),
+      );
+      let response: Response | undefined;
+      let responseText: string | undefined;
+      let errorCode: string | undefined;
+      let failure: Error | undefined;
+      let reason: TransportFailureReason | undefined;
+      try {
+        response = await this.request(`${this.baseUrl}${path}`, {
+          method: "POST",
+          redirect: "error",
+          headers: {
+            "content-type": "application/json",
+            "x-clawsweeper-exact-review-signature": signature,
+          },
+          body,
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          responseText = await response.text();
+        } else {
+          // Status alone determines retryability, even for plain-text edge errors.
+          errorCode = await responseErrorCode(response);
+          throw new Error(
+            `Batch queue ${path} failed (HTTP ${response.status})${errorCode ? `: ${errorCode}` : ""}`,
+          );
+        }
+      } catch (error) {
+        const status = response?.status;
+        if (status !== undefined && !response!.ok && (status < 500 || status > 599)) throw error;
+        reason =
+          status !== undefined && !response!.ok
+            ? `HTTP_${status}`
+            : controller.signal.aborted ||
+                error?.name === "TimeoutError" ||
+                error?.name === "AbortError"
+              ? "timeout"
+              : "network_error";
+        // Only a validated server code may accompany the closed failure class.
+        failure = new ExactReviewBatchQueueTransportError(
+          reason,
+          `Batch queue ${path} failed (${reason.startsWith("HTTP_") ? reason.replace("_", " ") : reason})${errorCode ? `: ${errorCode}` : ""}`,
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!failure) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(responseText ?? "");
+        } catch {
+          throw new Error(`Batch queue ${path} returned invalid JSON (HTTP ${response!.status})`);
+        }
+        const result = objectValue(parsed);
+        if (
+          rejectUnscopedRetriedDedupe &&
+          attempt > 1 &&
+          result.deduped === true &&
+          result.dedupe_scope !== "scheduled_queue_item"
+        ) {
+          throw new Error(`Batch queue ${path} returned an ambiguous dedupe after retry`);
+        }
+        return result;
+      }
+      if (attempt === maxAttempts) throw failure;
+      const backoff = Math.floor(1_000 * 2 ** (attempt - 1) * (0.5 + Math.random() * 0.5));
+      const delay = Math.max(
+        backoff,
+        retryAfterMs(response?.headers.get("retry-after"), Date.now()),
+      );
+      // No new request can be admitted once this confirmed lease/deadline expires.
+      if (Date.now() + delay >= deadline) throw failure;
+      console.warn(
+        `Batch queue retry endpoint=${path} reason=${reason} attempt=${attempt + 1}/${maxAttempts}`,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+    throw new Error(`Batch queue ${path} retry attempts exhausted`);
+  }
+}
+
+function retryAfterMs(value: string | null | undefined, now: number): number {
+  if (!value) return 0;
+  const seconds = /^\d+(?:\.\d+)?$/.test(value.trim()) ? Number(value) : NaN;
+  const delay = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(value) - now;
+  return Number.isFinite(delay) ? Math.min(MAX_RETRY_AFTER_MS, Math.max(0, delay)) : 0;
+}
+
+function parseQueueItem(value: unknown): ExactReviewBatchQueueItem {
+  const item = objectValue(value);
+  return {
+    ...parseMember(item),
+    decision: item.decision,
+    ...(item.repeat_revision === true ? { repeatRevision: true } : {}),
+  };
+}
+
+function parseLease(value: unknown): ExactReviewBatchLease {
+  const batch = objectValue(value);
+  const leaseOwner = stringValue(batch.lease_owner, "lease_owner");
+  const leaseExpiresAt = stringValue(batch.lease_expires_at, "lease_expires_at");
+  if (!Number.isFinite(Date.parse(leaseExpiresAt))) throw new Error("Invalid batch lease expiry");
+  const serverTime =
+    batch.server_time === undefined ? undefined : stringValue(batch.server_time, "server_time");
+  if (serverTime !== undefined && !Number.isFinite(Date.parse(serverTime))) {
+    throw new Error("Invalid batch server time");
+  }
+  return {
+    batchId: stringValue(batch.batch_id, "batch_id"),
+    leaseOwner,
+    leaseExpiresAt,
+    ...(serverTime === undefined ? {} : { serverTime }),
+    items: arrayValue(batch.items).map(parseMember),
+  };
+}
+
+function parseMember(value: unknown): ExactReviewBatchMember {
+  const item = objectValue(value);
+  return {
+    itemKey: stringValue(item.item_key, "item_key"),
+    revision: positiveInteger(item.revision, "revision"),
+    claimGeneration: positiveInteger(item.claim_generation, "claim_generation"),
+  };
+}
+
+function parseReconciliationSample(value: unknown): ExactReviewPublicationReconcileSample {
+  const sample = objectValue(value);
+  const reason = stringValue(sample.reason, "sample reason");
+  if (!RECONCILIATION_REASONS.has(reason as ExactReviewPublicationReconcileSample["reason"])) {
+    throw new Error("Invalid batch queue sample reason");
+  }
+  const producerRunId =
+    sample.producer_run_id === undefined
+      ? undefined
+      : stringValue(sample.producer_run_id, "sample producer_run_id");
+  const producerRunAttempt =
+    sample.producer_run_attempt === undefined
+      ? undefined
+      : positiveInteger(sample.producer_run_attempt, "sample producer_run_attempt");
+  if ((producerRunId === undefined) !== (producerRunAttempt === undefined)) {
+    throw new Error("Invalid batch queue sample producer identity");
+  }
+  const ack = stringValue(sample.acknowledgement_state, "sample acknowledgement_state");
+  if (!/^(not_required|pending|observed|skipped_(locked|missing_comment)|unavailable)$/.test(ack)) {
+    throw new Error("Invalid batch queue sample acknowledgement_state");
+  }
+  const hasAckUnavailableReason = Object.hasOwn(sample, "acknowledgement_unavailable_reason");
+  const ackUnavailableReason = !hasAckUnavailableReason
+    ? null
+    : sample.acknowledgement_unavailable_reason === null
+      ? null
+      : stringValue(
+          sample.acknowledgement_unavailable_reason,
+          "sample acknowledgement_unavailable_reason",
+        );
+  if (
+    ackUnavailableReason !== null &&
+    !ACKNOWLEDGEMENT_UNAVAILABLE_REASON.test(ackUnavailableReason)
+  ) {
+    throw new Error("Invalid batch queue sample acknowledgement_unavailable_reason");
+  }
+  if (!Object.hasOwn(sample, "successor_fence_state")) {
+    throw new Error("Invalid batch queue sample successor_fence_state");
+  }
+  const successorFenceState =
+    sample.successor_fence_state === null
+      ? null
+      : stringValue(sample.successor_fence_state, "sample successor_fence_state");
+  if (successorFenceState !== null && !SUCCESSOR_FENCE_STATE.test(successorFenceState)) {
+    throw new Error("Invalid batch queue sample successor_fence_state");
+  }
+  const commandContext = sample.command_context;
+  const staleCandidate = reason === "stale_revision" || reason === "duplicate_lineage";
+  const successorFenceApplicable =
+    reason === "stale_revision" && ackUnavailableReason === "terminal_missing";
+  if (
+    typeof commandContext !== "boolean" ||
+    typeof sample.supersede_safe !== "boolean" ||
+    commandContext === (ack === "not_required") ||
+    (hasAckUnavailableReason && (ack === "unavailable") !== (ackUnavailableReason !== null)) ||
+    successorFenceApplicable === (successorFenceState === null) ||
+    sample.supersede_safe !== (staleCandidate && !["pending", "unavailable"].includes(ack))
+  ) {
+    throw new Error("Invalid batch queue sample supersede safety");
+  }
+  return {
+    itemKey: stringValue(sample.item_key, "sample item_key"),
+    queueRevision: positiveInteger(sample.queue_revision, "sample queue_revision"),
+    reason: reason as ExactReviewPublicationReconcileSample["reason"],
+    targetKey: stringValue(sample.target_key, "sample target_key"),
+    publicationRevision: nullablePositiveInteger(
+      sample.publication_revision,
+      "sample publication_revision",
+    ),
+    supersededByRevision: nullablePositiveInteger(
+      sample.superseded_by_revision,
+      "sample superseded_by_revision",
+    ),
+    lineageClaimGeneration: nullablePositiveInteger(
+      sample.lineage_claim_generation,
+      "sample lineage_claim_generation",
+    ),
+    retainedItemKey: nullableStringValue(sample.retained_item_key, "sample retained_item_key"),
+    commandContext,
+    acknowledgementState: ack as ExactReviewPublicationAcknowledgementState,
+    acknowledgementUnavailableReason:
+      ackUnavailableReason as ExactReviewPublicationAcknowledgementUnavailableReason | null,
+    successorFenceState: successorFenceState as ExactReviewPublicationSuccessorFenceState | null,
+    supersedeSafe: sample.supersede_safe,
+    ...(producerRunId === undefined
+      ? {}
+      : { producerRunId, producerRunAttempt: producerRunAttempt! }),
+  };
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid batch queue response object");
+  }
+  return value as Record<string, unknown>;
+}
+
+function arrayValue(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new Error("Invalid batch queue response array");
+  return value;
+}
+
+function stringValue(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`Invalid batch queue ${name}`);
+  return value;
+}
+
+function positiveInteger(value: unknown, name: string): number {
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result < 1) throw new Error(`Invalid batch queue ${name}`);
+  return result;
+}
+
+function nonNegativeInteger(value: unknown, name: string): number {
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result < 0) throw new Error(`Invalid batch queue ${name}`);
+  return result;
+}
+
+function nullableNonNegativeInteger(value: unknown, name: string): number | null {
+  return value === null || value === undefined ? null : nonNegativeInteger(value, name);
+}
+
+function nullablePositiveInteger(value: unknown, name: string): number | null {
+  return value === null ? null : positiveInteger(value, name);
+}
+
+function nullableStringValue(value: unknown, name: string): string | null {
+  return value === null ? null : stringValue(value, name);
+}
