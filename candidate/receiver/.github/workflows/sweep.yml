@@ -297,6 +297,9 @@ jobs:
               retry_at="$(node -e 'process.stdout.write(new Date(Date.now() + 5 * 60_000).toISOString())')"
               {
                 echo "admission_retry=true"
+                echo "decision=$CLAIM_DECISION"
+                echo "target_branch=$CLAIM_TARGET_BRANCH"
+                echo "retry_kind=coordination"
                 echo "retry_at=$retry_at"
                 echo "proceed=false"
                 echo "terminal_noop=false"
@@ -1377,6 +1380,7 @@ jobs:
           PREPARATION_RECEIPT: "${{ toJSON(needs.event-review-prepare.outputs) }}"
           PREPARE_RESULT: "${{ needs.event-review-prepare.result }}"
           MODEL_RESULT: "${{ needs.event-review-apply.result }}"
+          CLAWHUB_ENABLED: ${{ vars.CLAWSWEEPER_ENABLE_CLAWHUB }}
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1395,7 +1399,11 @@ jobs:
             }
             if (p.protocol_version !== '2' || !positive(p.lease_revision) || !positive(p.claim_generation) || !p.lease_id) throw Error();
             const raw = JSON.parse(p.decision);
-            const d = JSON.parse(p.effective_decision || (process.env.PREPARE_RESULT !== 'success' ? p.decision : 'null'));
+            const noReservation = ['reservation_status','reservation_owner','reservation_comment_id','reservation_head_sha'].every(k => !p[k]);
+            const prepareOnly = process.env.PREPARE_RESULT === 'success' && process.env.MODEL_RESULT === 'skipped';
+            const disabledTarget = raw?.targetRepo === 'openclaw/clawhub' && process.env.CLAWHUB_ENABLED !== '1';
+            const disabledWithoutLive = disabledTarget && prepareOnly && noReservation && !p.retry_kind && !p.retry_at;
+            const d = JSON.parse(p.effective_decision || (disabledWithoutLive ? p.decision : 'null'));
             if (!raw || !d || Array.isArray(raw) || Array.isArray(d)) throw Error();
             if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw.targetRepo) || !Number.isSafeInteger(raw.itemNumber) || raw.itemNumber < 1 ||
                 !['issue','pull_request'].includes(raw.itemKind) || !['issues','pull_request'].includes(raw.sourceEvent) ||
@@ -1408,6 +1416,8 @@ jobs:
             if (status === 'posted' && (!/^[A-Za-z0-9._-]{1,200}$/.test(p.reservation_owner) || !positive(p.reservation_comment_id) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(p.reservation_head_sha))) throw Error();
             const retryKind = p.retry_kind || '', retryAt = p.retry_at || '';
             if (Boolean(retryKind) !== Boolean(retryAt) || (retryKind && (!['coordination','throttle'].includes(retryKind) || !Number.isFinite(Date.parse(retryAt))))) throw Error();
+            const branchIsUsable = /^[A-Za-z0-9_.\/-]+$/.test(d.targetBranch) && !/^[0-9]+$/.test(d.targetBranch) && !d.targetBranch.includes('..');
+            if (!branchIsUsable && !(prepareOnly && noReservation && retryKind && Date.parse(retryAt) > Date.now() && isDeepStrictEqual(raw,d))) throw Error();
             const [owner,name] = d.targetRepo.split('/');
             out({claimed:'true',protocol_version:'2',item_key:p.item_key,lease_id:p.lease_id,lease_revision:p.lease_revision,claim_generation:p.claim_generation,
               raw_decision:JSON.stringify(raw),decision:JSON.stringify(d),reservation_status:status,reservation_owner:p.reservation_owner||'',reservation_comment_id:p.reservation_comment_id||'',reservation_head_sha:p.reservation_head_sha||'',
@@ -1442,7 +1452,7 @@ jobs:
           )"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "$QUEUE_URL/internal/exact-review/heartbeat")"
+          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "${QUEUE_URL%/}/internal/exact-review/heartbeat")"
           HTTP_CODE="$http_code" RESPONSE_FILE="$response_file" node <<'NODE'
           const fs = require('node:fs');
           const r = JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE,'utf8'));
@@ -1532,7 +1542,7 @@ jobs:
           build-script: "build:node"
 
       - id: fresh-finalize-live
-        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' }}
+        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' && steps.finalize-preparation-context.outputs.retry_kind == '' }}
         env:
           CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.decision }}"
           RAW_CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.raw_decision }}"
@@ -1540,6 +1550,7 @@ jobs:
           ITEM_NUMBER: "${{ steps.finalize-preparation-context.outputs.item_number }}"
           CLAIM_TARGET_BRANCH: "${{ steps.finalize-preparation-context.outputs.target_branch }}"
           RESERVATION_HEAD_SHA: "${{ steps.finalize-preparation-context.outputs.reservation_head_sha }}"
+          CLAWHUB_ENABLED: ${{ vars.CLAWSWEEPER_ENABLE_CLAWHUB }}
           GH_TOKEN: "${{ secrets.CLAWSWEEPER_TARGET_READ_TOKEN }}"
         run: |
           set -euo pipefail
@@ -1575,6 +1586,9 @@ jobs:
           }
           try {
             if(!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1 || d.targetRepo!==repo || d.itemNumber!==number || d.targetBranch!==e.CLAIM_TARGET_BRANCH) throw Error('Invalid fresh context');
+            if(repo === 'openclaw/clawhub' && e.CLAWHUB_ENABLED !== '1') {
+              terminal('policy_noop'); process.exit(0);
+            }
             if(raw.targetBranch !== d.targetBranch && checkedRepo().default_branch !== d.targetBranch) {
               retry('coordination',60); process.exit(0);
             }
@@ -1654,7 +1668,7 @@ jobs:
           )"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "$QUEUE_URL/internal/exact-review/heartbeat")"
+          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "${QUEUE_URL%/}/internal/exact-review/heartbeat")"
           HTTP_CODE="$http_code" RESPONSE_FILE="$response_file" node <<'NODE'
           const fs = require('node:fs');
           const r = JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE,'utf8'));
@@ -1764,7 +1778,10 @@ jobs:
           NODE
           )"
           signature="$(PAYLOAD="$payload" node -e 'process.stdout.write("sha256="+require("node:crypto").createHmac("sha256",process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex"))')"
-          response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 --request POST --header 'content-type: application/json' --header "x-clawsweeper-exact-review-signature: $signature" --data "$payload" "$QUEUE_URL/internal/exact-review/lifecycle/terminal-disposition")"
+          if ! response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 --request POST --header 'content-type: application/json' --header "x-clawsweeper-exact-review-signature: $signature" --data "$payload" "${QUEUE_URL%/}/internal/exact-review/lifecycle/terminal-disposition")"; then
+            echo 'Terminal lifecycle persistence was not confirmed' >&2
+            exit 1
+          fi
           RESPONSE="$response" node <<'NODE'
           const r=JSON.parse(process.env.RESPONSE);
           if(r.ok!==true || r.lifecycle_state!==process.env.LIFECYCLE_TERMINAL) process.exit(1);
@@ -1938,7 +1955,7 @@ jobs:
           )"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "$QUEUE_URL/internal/exact-review/complete")"
+          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "${QUEUE_URL%/}/internal/exact-review/complete")"
           if [[ "$http_code" == 2* ]]; then exit 0; fi
           if [ "$http_code" = 409 ] && jq -e '.error == "lease_superseded"' "$response_file" >/dev/null; then exit 0; fi
           echo 'Producer completion was not confirmed' >&2
