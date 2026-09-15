@@ -29,3 +29,11 @@ jobs:
         env:
           OC3_REVIEW_CANDIDATE_DIR: candidate/receiver
         run: node --test test/openclaw3-review-only-receiver-entrypoints.test.ts
+      - name: Run planner-owned real entrypoints and wiring contracts
+        env:
+          OC3_REVIEW_CANDIDATE_DIR: candidate/receiver
+        run: >-
+          node --test
+          test/openclaw3-review-only-wiring.test.ts
+          test/repair/openclaw3-review-only-manual-entrypoint.test.ts
+          test/openclaw3-review-only-claim-entrypoint.test.ts
