@@ -65,11 +65,20 @@ jobs:
             --item-numbers "$ITEM_NUMBER" --request-id "$GITHUB_RUN_ID" \
             --codex-timeout-ms 1200000 --queue-url "$QUEUE_URL"
 
-  event-review-apply:
+  event-review-prepare:
     if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' }}
     runs-on: ubuntu-24.04
-    env:
-      CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
+    outputs:
+      claimed: ${{ steps.claim-exact-review-queue.outputs.claimed }}
+      protocol_version: ${{ steps.claim-exact-review-queue.outputs.protocol_version }}
+      item_key: ${{ steps.claim-exact-review-queue.outputs.item_key }}
+      lease_id: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
+      lease_revision: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+      claim_generation: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+      decision: ${{ steps.claim-exact-review-queue.outputs.decision }}
+      reservation_status: ${{ steps.reserve-exact-review-lease.outputs.status }}
+      reservation_owner: ${{ steps.reserve-exact-review-lease.outputs.owner }}
+      reservation_comment_id: ${{ steps.reserve-exact-review-lease.outputs.comment_id }}
     steps:
       - name: Fetch control-plane retry helper
         run: |
@@ -158,9 +167,11 @@ jobs:
           filter: blob:none
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-action-ledger
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
-        continue-on-error: true
+        with:
+          build-script: build:all
 
       - name: Resolve event payload
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
@@ -250,12 +261,6 @@ jobs:
           permission-issues: read
           permission-pull-requests: read
           permission-statuses: read
-
-      - uses: ./.github/actions/setup-pnpm
-        id: setup-pnpm
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
-        with:
-          build-script: build:all
 
       - name: Check live target item state
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.target_enabled == 'true' }}
@@ -459,59 +464,6 @@ jobs:
           permission-pull-requests: read
           permission-statuses: read
 
-      - name: Check out target repository
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
-        run: |
-          set -euo pipefail
-          url="https://github.com/${{ steps.target.outputs.target_repo }}.git"
-          cache_dir="${{ steps.target.outputs.target_checkout_dir }}-cache.git"
-          checkout_dir="${{ steps.target.outputs.target_checkout_dir }}"
-          target_branch="${{ steps.live-item.outputs.target_branch }}"
-          if [ -d "$cache_dir" ]; then
-            git -C "$cache_dir" remote set-url origin "$url"
-            git -C "$cache_dir" config remote.origin.promisor true
-            git -C "$cache_dir" config remote.origin.partialclonefilter blob:none
-            if [ -f "$cache_dir/shallow" ]; then
-              cache_fetch=(git -C "$cache_dir" fetch --prune --unshallow --filter=blob:none origin "$target_branch")
-            else
-              cache_fetch=(git -C "$cache_dir" fetch --prune --filter=blob:none origin "$target_branch")
-            fi
-            if ! "${cache_fetch[@]}"; then
-              echo "::warning::Cached target repository fetch failed; rebuilding cache."
-              rm -rf "$cache_dir"
-              git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
-            fi
-          else
-            git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
-          fi
-          if ! git clone --reference-if-able "$cache_dir" --dissociate --filter=blob:none --branch "$target_branch" --single-branch "$url" "$checkout_dir"; then
-            echo "::warning::Cached target checkout failed; retrying without cache reference."
-            rm -rf "$checkout_dir" "$cache_dir"
-            git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
-            git clone --filter=blob:none --branch "$target_branch" --single-branch "$url" "$checkout_dir"
-          fi
-          git -C "$checkout_dir" rev-parse --short HEAD
-
-      - uses: ./.github/actions/setup-openclaw-codex-source
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
-        with:
-          target-repo: ${{ steps.target.outputs.target_repo }}
-          target-dir: ${{ steps.target.outputs.target_checkout_dir }}
-
-      - uses: ./.github/actions/setup-codex
-        if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
-        env:
-          OPENAI_API_KEY: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.OPENAI_API_KEY || '' }}
-          CLAWSWEEPER_INTERNAL_MODEL: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.CLAWSWEEPER_MODEL || '' }}
-          CLAWSWEEPER_CLAWROUTER_CONFIG: ${{ secrets.CLAWSWEEPER_CLAWROUTER_CONFIG }}
-        with:
-          auth-mode: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE || 'proxy' }}
-          login-status: "true"
-          review-network: "true"
-
-      - uses: ./.github/actions/setup-openclaw
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' }}
-
       - name: Reserve exact review lease
         id: reserve-exact-review-lease
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
@@ -606,19 +558,482 @@ jobs:
           process.exit(1);
           NODE
 
-      # At-least-once queue delivery can overlap an exact-head review that is already
-      # running. The durable queue owns retry, so lease contention is deferred work.
+  event-review-apply:
+    needs: event-review-prepare
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' && needs.event-review-prepare.result == 'success' && needs.event-review-prepare.outputs.reservation_status == 'posted' }}
+    runs-on: ubuntu-24.04
+    env:
+      CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
+    steps:
+      - name: Fetch control-plane retry helper
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+      - name: Claim exact-review queue lease
+        id: claim-exact-review-queue
+        env:
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key }}
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          QUEUE_LEASE_REVISION: ${{ github.event.client_payload.queue_claim.lease_revision || github.event.client_payload.lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          test -n "$QUEUE_LEASE_ID"
+          printf 'claimed=false\ndecision={}\n' >> "$GITHUB_OUTPUT"
+          payload="$(node -e '
+            const revision = Number(process.env.QUEUE_LEASE_REVISION);
+            const attempt = Number(process.env.RUN_ATTEMPT);
+            if (!process.env.ITEM_KEY || !Number.isInteger(revision) || revision < 1 || !Number.isInteger(attempt) || attempt < 1) process.exit(1);
+            process.stdout.write(JSON.stringify({ lease_id: process.env.QUEUE_LEASE_ID, item_key: process.env.ITEM_KEY, lease_revision: revision, run_id: process.env.GITHUB_RUN_ID, run_attempt: attempt }));
+          ')"
+          response_file="$(mktemp)"; trap 'rm -f "$response_file"' EXIT
+          status="$(control_plane_curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "${QUEUE_URL%/}/internal/exact-review/claim")"
+          response="$(<"$response_file")"
+          if [ "$status" = 409 ]; then
+            conflict_reason="$(RESPONSE="$response" node <<'NODE'
+              const response = JSON.parse(process.env.RESPONSE || "{}");
+              const safeConflicts = new Set([
+                "lease_not_active",
+                "lease_already_claimed",
+                "lease_decision_unavailable",
+                "stale_run_attempt",
+              ]);
+              if (!safeConflicts.has(response.error)) process.exit(1);
+              process.stdout.write(response.error);
+          NODE
+            )" || {
+              echo "Unexpected exact-review lease conflict: $response" >&2
+              exit 1
+            }
+            echo "::notice::Skipping exact review because lease claim lost safely: $conflict_reason"
+            exit 0
+          fi
+          test "$status" = 200
+          RESPONSE="$response" node <<'NODE'
+          const fs = require("node:fs");
+          const value = JSON.parse(process.env.RESPONSE || "{}");
+          const requestedKey = process.env.ITEM_KEY;
+          const requestedRevision = Number(process.env.QUEUE_LEASE_REVISION);
+          const decision = value.decision;
+          const targetRepo = String(decision?.targetRepo || "");
+          const itemNumber = Number(decision?.itemNumber);
+          const canonicalItemKey = `${targetRepo}#${itemNumber}`;
+          if (
+            value.protocol_version !== 2 ||
+            value.claimed !== true ||
+            value.item_key !== requestedKey ||
+            value.lease_revision !== requestedRevision ||
+            !Number.isInteger(value.claim_generation) ||
+            value.claim_generation < 1 ||
+            typeof value.repeat_revision !== "boolean" ||
+            !decision ||
+            typeof decision !== "object" ||
+            !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
+            !Number.isInteger(itemNumber) ||
+            itemNumber < 1 ||
+            (decision.itemKind !== "issue" && decision.itemKind !== "pull_request") ||
+            (decision.sourceEvent !== "issues" && decision.sourceEvent !== "pull_request") ||
+            typeof decision.sourceAction !== "string" ||
+            !decision.sourceAction ||
+            canonicalItemKey !== requestedKey ||
+            value.item_key !== canonicalItemKey
+          ) process.exit(1);
+          if (decision.sourceAction !== "manual_explicit_review" || decision.publicationPolicy !== "record_comment_only") process.exit(1);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, ["claimed=true", `lease_id=${process.env.QUEUE_LEASE_ID}`, `item_key=${value.item_key}`, `lease_revision=${value.lease_revision}`, `claim_generation=${value.claim_generation}`, `repeat_revision=${value.repeat_revision}`, "protocol_version=2", `decision=${JSON.stringify(decision)}`].join("\n") + "\n");
+          NODE
+      - name: Restore trusted preparation receipt
+        id: reserve-exact-review-lease
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        env:
+          PREPARATION_RECEIPT: ${{ toJSON(needs.event-review-prepare.outputs) }}
+          CURRENT_CLAIM: ${{ toJSON(steps.claim-exact-review-queue.outputs) }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const { isDeepStrictEqual } = require("node:util");
+          const reject = () => {
+            console.error("Preparation receipt does not match current review authority.");
+            process.exit(1);
+          };
+          const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+          const positiveInteger = (value) =>
+            typeof value === "string" && /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value));
+          let prepared, current, preparedDecision, currentDecision;
+          try {
+            prepared = JSON.parse(process.env.PREPARATION_RECEIPT || "");
+            current = JSON.parse(process.env.CURRENT_CLAIM || "");
+            if (!object(prepared) || !object(current)) reject();
+            if (typeof prepared.decision !== "string" || typeof current.decision !== "string") reject();
+            preparedDecision = JSON.parse(prepared.decision);
+            currentDecision = JSON.parse(current.decision);
+          } catch {
+            reject();
+          }
+          if (
+            prepared.claimed !== "true" || current.claimed !== "true" ||
+            prepared.protocol_version !== "2" || current.protocol_version !== "2" ||
+            !object(preparedDecision) || !object(currentDecision) ||
+            !isDeepStrictEqual(preparedDecision, currentDecision)
+          ) reject();
+          for (const key of ["item_key", "lease_id"]) {
+            if (typeof prepared[key] !== "string" || !prepared[key].trim() || prepared[key] !== current[key]) reject();
+          }
+          for (const key of ["lease_revision", "claim_generation"]) {
+            if (!positiveInteger(prepared[key]) || !positiveInteger(current[key]) || prepared[key] !== current[key]) reject();
+          }
+          if (
+            prepared.reservation_status !== "posted" ||
+            typeof prepared.reservation_owner !== "string" ||
+            !/^[a-zA-Z0-9._-]{1,200}$/.test(prepared.reservation_owner) ||
+            !positiveInteger(prepared.reservation_comment_id)
+          ) reject();
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+            ["status=posted", "owner=" + prepared.reservation_owner, "comment_id=" + prepared.reservation_comment_id].join("\n") + "\n");
+          NODE
+
+      - uses: actions/checkout@v7
+        id: source-checkout
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-action-ledger
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        continue-on-error: true
+
+      - name: Resolve event payload
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        id: target
+        env:
+          CLAIM_DECISION: ${{ steps.claim-exact-review-queue.outputs.decision }}
+          CLAWHUB_ENABLED: ${{ vars.CLAWSWEEPER_ENABLE_CLAWHUB }}
+          CONFIGURED_CODEX_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_CODEX_TIMEOUT_MS || '1200000' }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const decision = JSON.parse(process.env.CLAIM_DECISION || "{}");
+          const targetRepo = String(decision.targetRepo || "");
+          const itemNumber = Number(decision.itemNumber);
+          if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo)) process.exit(1);
+          if (!Number.isInteger(itemNumber) || itemNumber < 1) process.exit(1);
+
+          // The review-start lease permits at most two hours, including its ten-minute
+          // cushion. The 120-minute job leaves 64 minutes for target checkout/setup and
+          // artifact/publication finalizers after this cap and the 11-minute review reserve.
+          const maxExactReviewCodexTimeoutMs = 2_700_000;
+          const configuredValue = Number(process.env.CONFIGURED_CODEX_TIMEOUT_MS);
+          const configuredTimeout =
+            Number.isInteger(configuredValue) && configuredValue > 0
+              ? Math.min(maxExactReviewCodexTimeoutMs, configuredValue)
+              : 1_200_000;
+          const adaptiveValue = Number(decision.codexTimeoutMs);
+          const adaptiveTimeout =
+            Number.isInteger(adaptiveValue) && adaptiveValue > 0
+              ? Math.min(1_800_000, Math.max(600_000, adaptiveValue))
+              : 0;
+          const requestedTimeout =
+            decision.sourceAction === "manual_explicit_review" &&
+            decision.publicationPolicy === "record_comment_only" &&
+            Number.isInteger(adaptiveValue) && adaptiveValue > 0
+              ? adaptiveValue
+              : Math.max(configuredTimeout, adaptiveTimeout);
+          const mediaValue = Number(decision.mediaProofTimeoutMs);
+          const mediaTimeout =
+            Number.isInteger(mediaValue) && mediaValue > 0 ? Math.min(480_000, mediaValue) : 0;
+          const [owner, name] = targetRepo.split("/");
+          const targetSlug = targetRepo.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
+          const checkoutDir = targetRepo === process.env.GITHUB_REPOSITORY ? `${name}-target` : name;
+          const hasCommandContext = Boolean(decision.commandStatusMarker || decision.statusCommentId);
+          const targetEnabled =
+            targetRepo !== "openclaw/clawhub" || process.env.CLAWHUB_ENABLED === "1";
+          const output = {
+            target_repo: targetRepo,
+            target_repo_owner: owner,
+            target_repo_name: name,
+            target_slug: targetSlug,
+            target_checkout_dir: checkoutDir,
+            item_number: itemNumber,
+            codex_timeout_ms: Math.min(
+              maxExactReviewCodexTimeoutMs,
+              requestedTimeout,
+            ),
+            media_proof_timeout_ms: mediaTimeout,
+            has_command_context: hasCommandContext,
+            target_enabled: targetEnabled,
+          };
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `${Object.entries(output)
+              .map(([key, value]) => `${key}=${value}`)
+              .join("\n")}\n`,
+          );
+          NODE
+
+      - name: Skip disabled claimed target
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.target_enabled == 'false' }}
+        run: echo "Completing the claimed exact-review lease without target access because this target is disabled."
+
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        with:
+          build-script: build:all
+
+      - name: Check live target item state
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.target_enabled == 'true' }}
+        id: live-item
+        env:
+          CLAIM_DECISION: ${{ steps.claim-exact-review-queue.outputs.decision }}
+          GH_TOKEN: ${{ secrets.CLAWSWEEPER_TARGET_READ_TOKEN }}
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          CLAIM_TARGET_BRANCH: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).targetBranch }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          target_branch="$CLAIM_TARGET_BRANCH"
+          branch_is_usable() {
+            local branch="$1"
+            [ -n "$branch" ] &&
+              printf '%s' "$branch" | grep -Eq '^[A-Za-z0-9_.\/-]+$' &&
+              ! printf '%s' "$branch" | grep -Eq '^[0-9]+$' &&
+              [[ "$branch" != *".."* ]]
+          }
+          if ! branch_is_usable "$target_branch"; then
+            queued_target_branch="$target_branch"
+            branch_error="$(mktemp)"
+            if ! target_branch="$(gh api "repos/$TARGET_REPO" --jq '.default_branch // empty' 2>"$branch_error")" ||
+              ! branch_is_usable "$target_branch"; then
+              echo "::warning::Unable to resolve a usable default branch for $TARGET_REPO after queued target branch '$queued_target_branch' was rejected; releasing the claim for retry."
+              cat "$branch_error" >&2
+              rm -f "$branch_error"
+              retry_at="$(node -e 'process.stdout.write(new Date(Date.now() + 5 * 60_000).toISOString())')"
+              {
+                echo "admission_retry=true"
+                echo "retry_at=$retry_at"
+                echo "proceed=false"
+                echo "terminal_noop=false"
+                echo "terminal_missing=false"
+                echo "guarded_open=false"
+                echo "guarded_open_action="
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            rm -f "$branch_error"
+            echo "::warning::Resolved invalid queued target branch '$queued_target_branch' to default branch '$target_branch' for $TARGET_REPO."
+          fi
+          effective_decision="$(CLAIM_DECISION="$CLAIM_DECISION" TARGET_BRANCH="$target_branch" node <<'NODE'
+          const decision = JSON.parse(process.env.CLAIM_DECISION || "{}");
+          decision.targetBranch = process.env.TARGET_BRANCH;
+          process.stdout.write(JSON.stringify(decision));
+          NODE
+          )"
+          {
+            echo "admission_retry=false"
+            echo "target_branch=$target_branch"
+            echo "decision=$effective_decision"
+          } >> "$GITHUB_OUTPUT"
+          live_item_error="$(mktemp)"
+          if ! live_item="$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" 2>"$live_item_error")"; then
+            if grep -Eqi 'HTTP 404|Not Found' "$live_item_error" && gh api "repos/$TARGET_REPO" >/dev/null; then
+              rm -f "$live_item_error"
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              echo "terminal_noop=false" >> "$GITHUB_OUTPUT"
+              echo "terminal_missing=true" >> "$GITHUB_OUTPUT"
+              echo "guarded_open=false" >> "$GITHUB_OUTPUT"
+              echo "guarded_open_action=" >> "$GITHUB_OUTPUT"
+              echo "::notice::Completing $TARGET_REPO#$ITEM_NUMBER because the repository is accessible but the item is missing."
+              exit 0
+            fi
+            if grep -Eqi 'rate limit exceeded|secondary rate limit|HTTP 429' "$live_item_error"; then
+              cat "$live_item_error" >&2
+              rm -f "$live_item_error"
+              retry_at="$(node -e 'process.stdout.write(new Date(Date.now() + 20 * 60_000).toISOString())')"
+              echo "::notice::GitHub throttled the live-item check for $TARGET_REPO#$ITEM_NUMBER; releasing the claim for retry at $retry_at without spending failure budget."
+              {
+                echo "admission_retry=true"
+                echo "retry_kind=throttle"
+                echo "retry_at=$retry_at"
+                echo "proceed=false"
+                echo "terminal_noop=false"
+                echo "terminal_missing=false"
+                echo "guarded_open=false"
+                echo "guarded_open_action="
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "$live_item_error" >&2
+            rm -f "$live_item_error"
+            exit 1
+          fi
+          rm -f "$live_item_error"
+          live_state="$(jq -r '.state' <<< "$live_item")"
+          live_locked="$(jq -r '.locked == true' <<< "$live_item")"
+          item_kind="$(jq -r 'if .pull_request then "pull_request" else "issue" end' <<< "$live_item")"
+          echo "item_kind=$item_kind" >> "$GITHUB_OUTPUT"
+          live_head_sha=""
+          if [ "$live_state" = "open" ] && [ "$live_locked" != "true" ] && [ "$item_kind" = "pull_request" ]; then
+            pull_observed_at="$(node -e 'process.stdout.write(new Date().toISOString())')"
+            if live_pull="$(gh api "repos/$TARGET_REPO/pulls/$ITEM_NUMBER")"; then
+            live_head_sha="$(jq -r '.head.sha // empty' <<< "$live_pull")"
+            mkdir -p .artifacts
+            jq -n --arg repo "$TARGET_REPO" --arg observedAt "$pull_observed_at" --argjson pull "$live_pull" '{repo: $repo, pull: $pull, observedAt: $observedAt}' > .artifacts/exact-pr-admission.json
+            oversized="$(node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { oversizedPullRequestAdmission } from "./dist/clawsweeper-oversized-pr-policy.js";
+          const { pull } = JSON.parse(readFileSync(".artifacts/exact-pr-admission.json", "utf8"));
+          process.stdout.write(String(!oversizedPullRequestAdmission(pull).admitted));
+          NODE
+          )"
+            echo "pr_admission_file=.artifacts/exact-pr-admission.json" >> "$GITHUB_OUTPUT"
+            echo "oversized=$oversized" >> "$GITHUB_OUTPUT"
+            if [ "$oversized" = "true" ]; then
+              {
+                echo "proceed=true"
+                echo "scheduled_semantic_noop=false"
+                echo "terminal_noop=false"
+                echo "terminal_missing=false"
+                echo "guarded_open=false"
+                echo "guarded_open_action="
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            else
+              echo "::warning::Unable to read PR admission metadata; preserving normal review admission."
+            fi
+          fi
+          if [ "$live_state" = "open" ] && [ "$live_locked" != "true" ] &&
+            jq -e '.sourceAction == "scheduled_hot_intake"' <<< "$CLAIM_DECISION" >/dev/null; then
+            comments_error="$(mktemp)"
+            if live_comments="$(gh api --paginate --slurp "repos/$TARGET_REPO/issues/$ITEM_NUMBER/comments?per_page=100" 2>"$comments_error" | jq 'add')"; then
+              classification_output="$(mktemp)"
+              if CLAIM_DECISION="$CLAIM_DECISION" LIVE_ITEM="$live_item" LIVE_COMMENTS="$live_comments" LIVE_HEAD_SHA="$live_head_sha" GITHUB_OUTPUT="$classification_output" \
+                node scripts/classify-scheduled-review-noop.ts; then
+                cat "$classification_output" >> "$GITHUB_OUTPUT"
+                if grep -qx 'scheduled_noop=true' "$classification_output"; then
+                  reason="$(sed -n 's/^scheduled_noop_reason=//p' "$classification_output")"
+                  rm -f "$classification_output" "$comments_error"
+                  {
+                    echo "proceed=false"
+                    echo "terminal_noop=false"
+                    echo "scheduled_semantic_noop=true"
+                    echo "terminal_missing=false"
+                    echo "guarded_open=false"
+                    echo "guarded_open_action="
+                  } >> "$GITHUB_OUTPUT"
+                  echo "::notice::Completing $TARGET_REPO#$ITEM_NUMBER as a scheduled no-op before target checkout because $reason."
+                  exit 0
+                fi
+              else
+                echo "::warning::Scheduled no-op classification failed; preserving normal review admission."
+              fi
+              rm -f "$classification_output"
+            else
+              echo "::warning::Unable to read comments for scheduled no-op classification; preserving normal review admission."
+              cat "$comments_error" >&2
+            fi
+            rm -f "$comments_error"
+          fi
+          case "$live_state" in
+            open)
+              echo "scheduled_semantic_noop=false" >> "$GITHUB_OUTPUT"
+              echo "terminal_noop=false" >> "$GITHUB_OUTPUT"
+              echo "terminal_missing=false" >> "$GITHUB_OUTPUT"
+              if [ "$live_locked" = "true" ]; then
+                echo "proceed=false" >> "$GITHUB_OUTPUT"
+                echo "guarded_open=true" >> "$GITHUB_OUTPUT"
+                echo "guarded_open_action=skipped_locked_conversation" >> "$GITHUB_OUTPUT"
+                echo "::notice::Completing $TARGET_REPO#$ITEM_NUMBER without Codex because the open conversation is locked."
+              else
+                echo "proceed=true" >> "$GITHUB_OUTPUT"
+                echo "guarded_open=false" >> "$GITHUB_OUTPUT"
+                echo "guarded_open_action=" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            closed)
+              echo "scheduled_semantic_noop=false" >> "$GITHUB_OUTPUT"
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              echo "terminal_noop=true" >> "$GITHUB_OUTPUT"
+              echo "terminal_missing=false" >> "$GITHUB_OUTPUT"
+              echo "guarded_open=false" >> "$GITHUB_OUTPUT"
+              echo "guarded_open_action=" >> "$GITHUB_OUTPUT"
+              echo "::notice::Skipping terminal $TARGET_REPO#$ITEM_NUMBER because it is already closed."
+              ;;
+            *)
+              echo "Unexpected live state for $TARGET_REPO#$ITEM_NUMBER: $live_state" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Check out target repository
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${{ steps.target.outputs.target_repo }}.git"
+          cache_dir="${{ steps.target.outputs.target_checkout_dir }}-cache.git"
+          checkout_dir="${{ steps.target.outputs.target_checkout_dir }}"
+          target_branch="${{ steps.live-item.outputs.target_branch }}"
+          if [ -d "$cache_dir" ]; then
+            git -C "$cache_dir" remote set-url origin "$url"
+            git -C "$cache_dir" config remote.origin.promisor true
+            git -C "$cache_dir" config remote.origin.partialclonefilter blob:none
+            if [ -f "$cache_dir/shallow" ]; then
+              cache_fetch=(git -C "$cache_dir" fetch --prune --unshallow --filter=blob:none origin "$target_branch")
+            else
+              cache_fetch=(git -C "$cache_dir" fetch --prune --filter=blob:none origin "$target_branch")
+            fi
+            if ! "${cache_fetch[@]}"; then
+              echo "::warning::Cached target repository fetch failed; rebuilding cache."
+              rm -rf "$cache_dir"
+              git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
+            fi
+          else
+            git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
+          fi
+          if ! git clone --reference-if-able "$cache_dir" --dissociate --filter=blob:none --branch "$target_branch" --single-branch "$url" "$checkout_dir"; then
+            echo "::warning::Cached target checkout failed; retrying without cache reference."
+            rm -rf "$checkout_dir" "$cache_dir"
+            git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
+            git clone --filter=blob:none --branch "$target_branch" --single-branch "$url" "$checkout_dir"
+          fi
+          git -C "$checkout_dir" rev-parse --short HEAD
+
+      - uses: ./.github/actions/setup-openclaw-codex-source
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
+        with:
+          target-repo: ${{ steps.target.outputs.target_repo }}
+          target-dir: ${{ steps.target.outputs.target_checkout_dir }}
+
+      - uses: ./.github/actions/setup-codex
+        if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
+        env:
+          OPENAI_API_KEY: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.OPENAI_API_KEY || '' }}
+          CLAWSWEEPER_INTERNAL_MODEL: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.CLAWSWEEPER_MODEL || '' }}
+          CLAWSWEEPER_CLAWROUTER_CONFIG: ${{ secrets.CLAWSWEEPER_CLAWROUTER_CONFIG }}
+        with:
+          auth-mode: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE || 'proxy' }}
+          login-status: "true"
+          review-network: "true"
+
+      - uses: ./.github/actions/setup-openclaw
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.live-item.outputs.oversized != 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
+
       - name: Review exact event item
         id: review-exact-event-item
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
         env:
           PR_ADMISSION_FILE: ${{ steps.live-item.outputs.pr_admission_file }}
           OVERSIZED_PR: ${{ steps.live-item.outputs.oversized }}
-          # Review hydration is the largest read stream (~30 calls/review); it
-          # stays on the App installation bucket so the per-repo Actions pool
-          # keeps headroom for the comment-router and support lanes.
-          GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
-          CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ steps.target-read-token.outputs.token }}
+          # Target reads use the separately provisioned read-only credential.
+          GH_TOKEN: ${{ secrets.CLAWSWEEPER_TARGET_READ_TOKEN }}
+          CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ secrets.CLAWSWEEPER_TARGET_READ_TOKEN }}
           ADDITIONAL_PROMPT: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).additionalPrompt || '' }}
           CLAWSWEEPER_RELATED_GITHUB_SEARCH: ${{ vars.CLAWSWEEPER_RELATED_GITHUB_SEARCH || '1' }}
           EXACT_REVIEW_ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
