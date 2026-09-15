@@ -77,3 +77,12 @@ jobs:
           test/repair/exact-review-bundle.test.ts
           test/openclaw3-review-only-artifact-topology.test.ts
           test/openclaw3-review-only-bundle-entrypoint.test.ts
+      - name: Run planner-owned trusted finalize and precise owner lifecycle
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        env:
+          OC3_REVIEW_CANDIDATE_DIR: candidate/receiver
+        run: >-
+          node --test
+          test/openclaw3-review-only-finalize-topology.test.ts
+          test/openclaw3-review-only-finalize-entrypoint.test.ts
+          test/openclaw3-review-only-finalize-live-cleanup.test.ts

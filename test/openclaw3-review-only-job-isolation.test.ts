@@ -21,6 +21,11 @@ const expectedOutputs = {
   reservation_status: "steps.reserve-exact-review-lease.outputs.status",
   reservation_owner: "steps.reserve-exact-review-lease.outputs.owner",
   reservation_comment_id: "steps.reserve-exact-review-lease.outputs.comment_id",
+  // R06-B author-approved receipt extension; every original mapping/guard remains.
+  effective_decision: "steps.live-item.outputs.decision",
+  retry_kind: "steps.live-item.outputs.retry_kind||steps.reserve-exact-review-lease.outputs.retry_kind",
+  retry_at: "steps.live-item.outputs.retry_at||steps.reserve-exact-review-lease.outputs.retry_at",
+  reservation_head_sha: "steps.reserve-exact-review-lease.outputs.head_sha",
 };
 function job(id: string) {
   const value = sweep.jobs[id];
@@ -86,7 +91,7 @@ test("R05-B privileged reservation has a separate trusted job and real output pr
   assert.equal(prepare.steps.some((entry: any) => /setup-codex|setup-openclaw$/.test(entry.uses || "") || /\bpnpm\s+(?:run\s+)?review\b/.test(entry.run || "")), false,
     "do not place model execution back beside privileged preparation");
   assert.deepEqual(Object.keys(prepare.outputs || {}).sort(), Object.keys(expectedOutputs).sort(),
-    "the preparation receipt contains only the ten reviewed authority/reservation outputs");
+    "the preparation receipt contains exactly the fourteen author-approved authority/reservation outputs");
   for (const [name, producer] of Object.entries(expectedOutputs))
     assert.equal(compact(prepare.outputs[name]), "${{" + producer + "}}", `${name} must come from its real preparation producer`);
   const needs = Array.isArray(model.needs) ? model.needs : [model.needs];

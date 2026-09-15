@@ -16,7 +16,8 @@ const candidatePath = "candidate/receiver/.github/workflows/sweep.yml";
 const targetRepo = "123oqwe/openclaw3-clawsweeper-sandbox";
 const itemKey = `${targetRepo}#41`;
 const runId = "41001";
-const preparedFields = ["claimed", "protocol_version", "item_key", "lease_id", "lease_revision", "claim_generation", "decision", "reservation_status", "reservation_owner", "reservation_comment_id"];
+// R06-B author-approved extension; this receipt fixture does not execute reserve CLI.
+const preparedFields = ["claimed", "protocol_version", "item_key", "lease_id", "lease_revision", "claim_generation", "decision", "reservation_status", "reservation_owner", "reservation_comment_id", "effective_decision", "retry_kind", "retry_at", "reservation_head_sha"];
 type Outputs = Record<string, string>;
 type Step = { id?: string; name?: string; run?: string; env?: Outputs };
 type Job = { steps?: Step[]; outputs?: Outputs };
@@ -202,7 +203,10 @@ test("R05-B candidate preparation/model bridge consumes a real repeated claim", 
       const expressions: Outputs = {};
       for (const [key, value] of Object.entries(preparedClaim.outputs)) expressions[`steps.claim-exact-review-queue.outputs.${key}`] = value;
       // Existing reserve CLI's posted-output shape, not an executed comment mutation.
-      for (const [key, value] of Object.entries({ status: "posted", owner: "oc3-prepared-41001", comment_id: "41010" })) expressions[`steps.reserve-exact-review-lease.outputs.${key}`] = value;
+      for (const [key, value] of Object.entries({ status: "posted", owner: "oc3-prepared-41001", comment_id: "41010", head_sha: fixture().decision.sourceHeadSha })) expressions[`steps.reserve-exact-review-lease.outputs.${key}`] = value;
+      expressions["steps.live-item.outputs.decision"] = preparedClaim.outputs.decision;
+      expressions["steps.live-item.outputs.retry_kind || steps.reserve-exact-review-lease.outputs.retry_kind"] = "";
+      expressions["steps.live-item.outputs.retry_at || steps.reserve-exact-review-lease.outputs.retry_at"] = "";
       assert.deepEqual(Object.keys(prepare.outputs || {}).sort(), [...preparedFields].sort());
       const receipt = Object.fromEntries(Object.entries(prepare.outputs || {}).map(([key, value]) => [key, render(value, expressions)]));
       scenario.mutate?.(receipt);
