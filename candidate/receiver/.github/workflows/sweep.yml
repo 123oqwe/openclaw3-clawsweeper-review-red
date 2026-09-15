@@ -132,8 +132,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      issues: write
-      pull-requests: write
     steps:
       - name: Fetch control-plane retry helper
         shell: bash
@@ -311,3 +309,12 @@ jobs:
             fi
           fi
           exit 1
+      - name: Mint narrowly scoped reviewer identity token
+        id: reviewer-token
+        if: ${{ steps.publication-context.outputs.claimed == 'true' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-issues: write
