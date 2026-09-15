@@ -29,6 +29,7 @@ env:
 
 jobs:
   admit-manual-target:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/hosted-target-admission.yml
     with:
       target_repository: ${{ inputs.target_repo }}
@@ -65,7 +66,7 @@ jobs:
             --codex-timeout-ms 1200000 --queue-url "$QUEUE_URL"
 
   event-review-apply:
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' }}
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Fetch control-plane retry helper
@@ -97,6 +98,22 @@ jobs:
           status="$(control_plane_curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "${QUEUE_URL%/}/internal/exact-review/claim")"
           response="$(<"$response_file")"
           if [ "$status" = 409 ]; then
+            conflict_reason="$(RESPONSE="$response" node <<'NODE'
+              const response = JSON.parse(process.env.RESPONSE || "{}");
+              const safeConflicts = new Set([
+                "lease_not_active",
+                "lease_already_claimed",
+                "lease_decision_unavailable",
+                "stale_run_attempt",
+              ]);
+              if (!safeConflicts.has(response.error)) process.exit(1);
+              process.stdout.write(response.error);
+          NODE
+            )" || {
+              echo "Unexpected exact-review lease conflict: $response" >&2
+              exit 1
+            }
+            echo "::notice::Skipping exact review because lease claim lost safely: $conflict_reason"
             exit 0
           fi
           test "$status" = 200
@@ -106,7 +123,29 @@ jobs:
           const requestedKey = process.env.ITEM_KEY;
           const requestedRevision = Number(process.env.QUEUE_LEASE_REVISION);
           const decision = value.decision;
-          if (value.protocol_version !== 2 || value.claimed !== true || value.item_key !== requestedKey || value.lease_revision !== requestedRevision || !Number.isInteger(value.claim_generation) || value.claim_generation < 1 || typeof value.repeat_revision !== "boolean" || !decision || typeof decision !== "object") process.exit(1);
+          const targetRepo = String(decision?.targetRepo || "");
+          const itemNumber = Number(decision?.itemNumber);
+          const canonicalItemKey = `${targetRepo}#${itemNumber}`;
+          if (
+            value.protocol_version !== 2 ||
+            value.claimed !== true ||
+            value.item_key !== requestedKey ||
+            value.lease_revision !== requestedRevision ||
+            !Number.isInteger(value.claim_generation) ||
+            value.claim_generation < 1 ||
+            typeof value.repeat_revision !== "boolean" ||
+            !decision ||
+            typeof decision !== "object" ||
+            !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
+            !Number.isInteger(itemNumber) ||
+            itemNumber < 1 ||
+            (decision.itemKind !== "issue" && decision.itemKind !== "pull_request") ||
+            (decision.sourceEvent !== "issues" && decision.sourceEvent !== "pull_request") ||
+            typeof decision.sourceAction !== "string" ||
+            !decision.sourceAction ||
+            canonicalItemKey !== requestedKey ||
+            value.item_key !== canonicalItemKey
+          ) process.exit(1);
           if (decision.sourceAction !== "manual_explicit_review" || decision.publicationPolicy !== "record_comment_only") process.exit(1);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, ["claimed=true", `lease_id=${process.env.QUEUE_LEASE_ID}`, `item_key=${value.item_key}`, `lease_revision=${value.lease_revision}`, `claim_generation=${value.claim_generation}`, `repeat_revision=${value.repeat_revision}`, "protocol_version=2", `decision=${JSON.stringify(decision)}`].join("\n") + "\n");
           NODE

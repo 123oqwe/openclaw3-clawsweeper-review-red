@@ -82,10 +82,34 @@ jobs:
                 redirect: "manual", signal: AbortSignal.timeout(20_000),
                 headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.METADATA_TOKEN}` },
               });
-              if (response.status === 404) outcome = "terminal";
-              else if (response.status === 200) {
-                const repository = await response.json();
-                outcome = repository && repository.private === false ? "public" : "terminal";
+              if (response.status === 404) {
+                outcome = "terminal";
+              } else if (response.status === 200) {
+                let repository;
+                try {
+                  repository = await response.json();
+                } catch {
+                  repository = null;
+                }
+                const target = String(process.env.TARGET_REPOSITORY || "").trim().toLowerCase();
+                const fullName =
+                  repository && typeof repository.full_name === "string"
+                    ? repository.full_name.trim().toLowerCase()
+                    : "";
+                const visibility =
+                  repository && typeof repository.visibility === "string"
+                    ? repository.visibility.trim().toLowerCase()
+                    : "";
+                if (
+                  fullName &&
+                  typeof repository?.private === "boolean" &&
+                  ["public", "private", "internal"].includes(visibility)
+                ) {
+                  outcome =
+                    fullName === target && repository.private === false && visibility === "public"
+                      ? "public"
+                      : "terminal";
+                }
               }
             } catch {}
           }
