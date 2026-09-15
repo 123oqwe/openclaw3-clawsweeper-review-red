@@ -559,6 +559,9 @@ jobs:
           NODE
 
   event-review-apply:
+    outputs:
+      artifact_name: ${{ steps.create-exact-review-bundle.outputs.artifact_name }}
+      generation_attempt: ${{ steps.create-exact-review-bundle.outputs.generation_attempt }}
     needs: event-review-prepare
     if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' && needs.event-review-prepare.result == 'success' && needs.event-review-prepare.outputs.reservation_status == 'posted' }}
     runs-on: ubuntu-24.04
@@ -1309,6 +1312,49 @@ jobs:
             echo "terminal_during_review=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Create exact review artifact bundle
+        id: create-exact-review-bundle
+        if: ${{ !cancelled() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.target_enabled == 'true' && steps.live-item.outcome == 'success' && steps.live-item.outputs.scheduled_semantic_noop != 'true' && steps.live-item.outputs.admission_retry != 'true' && steps.setup-pnpm.outcome == 'success' && steps.review-exact-event-item.outcome == 'success' && steps.review-exact-event-item.outputs.superseded != 'true' && steps.review-exact-event-item.outputs.retry_at == '' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
+        env:
+          EXACT_REVIEW_ACTION_LEDGER_ROOT: ${{ env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT }}
+          EXACT_REVIEW_BUNDLE_DIR: .artifacts/exact-review-bundle
+          EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+          EXACT_REVIEW_DECISION: ${{ steps.live-item.outputs.decision }}
+          EXACT_REVIEW_GENERATION_ATTEMPT: ${{ github.run_attempt }}
+          EXACT_REVIEW_ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
+          EXACT_REVIEW_ITEM_KIND: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind }}
+          EXACT_REVIEW_ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          EXACT_REVIEW_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          EXACT_REVIEW_LIVE_GUARDED_OPEN: ${{ steps.live-item.outputs.guarded_open }}
+          EXACT_REVIEW_LIVE_PROCEEDED: ${{ steps.review-exact-event-item.outputs.terminal_during_review == 'true' && 'false' || steps.live-item.outputs.proceed }}
+          EXACT_REVIEW_LIVE_TERMINAL_MISSING: ${{ steps.live-item.outputs.terminal_missing }}
+          EXACT_REVIEW_LIVE_TERMINAL_NOOP: ${{ steps.review-exact-event-item.outputs.terminal_during_review == 'true' && 'true' || steps.live-item.outputs.terminal_noop }}
+          EXACT_REVIEW_PRODUCER_JOB: event-review-apply
+          EXACT_REVIEW_PROTOCOL_VERSION: ${{ steps.claim-exact-review-queue.outputs.protocol_version }}
+          EXACT_REVIEW_REPORT_PATH: artifacts/event/${{ steps.target.outputs.item_number }}.md
+          EXACT_REVIEW_TARGET_BRANCH: ${{ steps.live-item.outputs.target_branch }}
+          EXACT_REVIEW_TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:exact-review-bundle create > .artifacts/exact-review-bundle-create.json
+          artifact_name="exact-review-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "artifact_name=$artifact_name"
+            echo "generation_attempt=$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact review artifact bundle
+        id: upload-exact-review-bundle
+        if: ${{ !cancelled() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.create-exact-review-bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.create-exact-review-bundle.outputs.artifact_name }}
+          path: .artifacts/exact-review-bundle
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
   event-review-publish:
     name: Publish exact review artifact
     if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'exact_review_artifact_publish' }}
@@ -1316,6 +1362,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Fetch control-plane retry helper
         shell: bash
@@ -1493,12 +1540,60 @@ jobs:
             fi
           fi
           exit 1
+      - name: Check out trusted receiver source
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
+        with:
+          build-script: build:repair
+
+      - name: Download exact review artifact bundle
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
+        id: download-exact-review-bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.publication-context.outputs.artifact_name }}
+          run-id: ${{ steps.publication-context.outputs.producer_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: .artifacts/exact-review-bundle
+
+      - name: Validate exact review artifact bundle
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.download-exact-review-bundle.outcome == 'success' }}
+        id: validate-exact-review-bundle
+        env:
+          EXACT_REVIEW_BUNDLE_DIR: .artifacts/exact-review-bundle
+          EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.publication-context.outputs.claim_generation }}
+          EXACT_REVIEW_DECISION: ${{ steps.publication-context.outputs.decision }}
+          EXACT_REVIEW_GENERATION_ATTEMPT: ${{ steps.publication-context.outputs.generation_attempt }}
+          EXACT_REVIEW_ITEM_KEY: ${{ steps.publication-context.outputs.item_key }}
+          EXACT_REVIEW_ITEM_KIND: ${{ steps.publication-context.outputs.item_kind }}
+          EXACT_REVIEW_ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          EXACT_REVIEW_LEASE_REVISION: ${{ steps.publication-context.outputs.lease_revision }}
+          EXACT_REVIEW_LIVE_GUARDED_OPEN: ${{ steps.publication-context.outputs.live_guarded_open }}
+          EXACT_REVIEW_LIVE_PROCEEDED: ${{ steps.publication-context.outputs.live_proceeded }}
+          EXACT_REVIEW_LIVE_TERMINAL_MISSING: ${{ steps.publication-context.outputs.live_terminal_missing }}
+          EXACT_REVIEW_LIVE_TERMINAL_NOOP: ${{ steps.publication-context.outputs.live_terminal_noop }}
+          EXACT_REVIEW_PRODUCER_JOB: event-review-apply
+          EXACT_REVIEW_PRODUCER_RUN_ID: ${{ steps.publication-context.outputs.producer_run_id }}
+          EXACT_REVIEW_PROTOCOL_VERSION: ${{ steps.publication-context.outputs.protocol_version }}
+          EXACT_REVIEW_SOURCE_SHA: ${{ steps.publication-context.outputs.source_sha }}
+          EXACT_REVIEW_TARGET_BRANCH: ${{ steps.publication-context.outputs.target_branch }}
+          EXACT_REVIEW_TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+        run: pnpm run --silent repair:exact-review-bundle validate
+
       - name: Mint narrowly scoped reviewer identity token
         id: reviewer-token
-        if: ${{ steps.publication-context.outputs.claimed == 'true' }}
-        uses: actions/create-github-app-token@v3
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
-          app-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          owner: ${{ steps.publication-context.outputs.target_repo_owner }}
+          repositories: ${{ steps.publication-context.outputs.target_repo_name }}
           permission-issues: write
