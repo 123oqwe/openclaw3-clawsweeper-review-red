@@ -52,3 +52,11 @@ jobs:
           node --test
           test/openclaw3-review-only-executor-topology.test.ts
           test/openclaw3-review-only-executor-handoff.test.ts
+      - name: Run planner-owned real model process credential boundary
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        run: node --test test/openclaw3-review-only-model-env.test.ts
+      - name: Regress existing agent capabilities and review authentication
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        run: |
+          node --test test/agent-runner.test.ts
+          node --test --test-name-pattern '^runCodex honors env login config unless preserving local Codex auth$' test/codex-review-runner.test.ts
