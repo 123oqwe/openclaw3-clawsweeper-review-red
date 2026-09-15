@@ -22,6 +22,7 @@ jobs:
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
       - name: Build existing runtime dependencies for behavioral baseline
+        id: build-runtime
         run: pnpm run build:node
       - name: Run planner-owned signed intake integration baseline
         run: node --test test/repair/openclaw3-review-only-intake.test.ts
@@ -37,3 +38,6 @@ jobs:
           test/openclaw3-review-only-wiring.test.ts
           test/repair/openclaw3-review-only-manual-entrypoint.test.ts
           test/openclaw3-review-only-claim-entrypoint.test.ts
+      - name: Run planner-owned publisher claim consumer
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        run: node --test test/openclaw3-review-only-publisher-claim.test.ts
