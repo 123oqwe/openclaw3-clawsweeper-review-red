@@ -68,3 +68,12 @@ jobs:
           node --test
           test/openclaw3-review-only-job-isolation.test.ts
           test/openclaw3-review-only-preparation-handoff.test.ts
+      - name: Run planner-owned real artifact endpoints and existing bundle regressions
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        env:
+          OC3_REVIEW_CANDIDATE_DIR: candidate/receiver
+        run: >-
+          node --test
+          test/repair/exact-review-bundle.test.ts
+          test/openclaw3-review-only-artifact-topology.test.ts
+          test/openclaw3-review-only-bundle-entrypoint.test.ts
