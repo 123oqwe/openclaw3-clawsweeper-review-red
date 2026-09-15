@@ -25,5 +25,7 @@ jobs:
         run: pnpm run build:node
       - name: Run planner-owned signed intake integration baseline
         run: node --test test/repair/openclaw3-review-only-intake.test.ts
-      - name: Run planner-owned receiver contract RED
+      - name: Run planner-owned receiver candidate contract
+        env:
+          OC3_REVIEW_CANDIDATE_DIR: candidate/receiver
         run: node --test test/openclaw3-review-only-receiver-entrypoints.test.ts
