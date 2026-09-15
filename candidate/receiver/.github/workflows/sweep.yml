@@ -1,0 +1,80 @@
+name: OpenClaw 3 review-only receiver
+
+on:
+  repository_dispatch:
+    types: [clawsweeper_item]
+  workflow_dispatch:
+    inputs:
+      item_number:
+        description: Pull request or issue number selected for review
+        required: true
+        type: string
+      target_repo:
+        description: Explicit registered target repository
+        required: true
+        type: string
+
+# The workflow's ambient token is never used to mutate a target.
+permissions:
+  contents: read
+
+env:
+  CLAWSWEEPER_APP_CLIENT_ID: ${{ vars.CLAWSWEEPER_APP_CLIENT_ID }}
+  EXACT_REVIEW_QUEUE_URL: ${{ vars.EXACT_REVIEW_QUEUE_URL }}
+
+jobs:
+  manual-selection:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enqueue explicit review-only selection
+        env:
+          ITEM_NUMBER: ${{ inputs.item_number }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          EXACT_REVIEW_QUEUE_SHARED_SECRET: ${{ secrets.EXACT_REVIEW_QUEUE_SHARED_SECRET }}
+        run: |
+          test -n "$ITEM_NUMBER"
+          test -n "$TARGET_REPO"
+          test -n "$EXACT_REVIEW_QUEUE_SHARED_SECRET"
+          # The Worker accepts only the signed record_comment_only manual schema.
+          node dist/repair/manual-review-enqueue.js \
+            --target-repo "$TARGET_REPO" --item-number "$ITEM_NUMBER" \
+            --queue-url "$EXACT_REVIEW_QUEUE_URL"
+
+  event-review-apply:
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' && github.event.client_payload.publication_policy == 'record_comment_only' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Claim exact-review queue lease
+        env:
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          EXACT_REVIEW_QUEUE_SHARED_SECRET: ${{ secrets.EXACT_REVIEW_QUEUE_SHARED_SECRET }}
+        run: |
+          test -n "$QUEUE_LEASE_ID"
+          test -n "$EXACT_REVIEW_QUEUE_SHARED_SECRET"
+          # Claim is intentionally before any model credential or model setup.
+          node dist/repair/exact-review-claim.js --lease "$QUEUE_LEASE_ID"
+      - name: Setup review model after a successful claim
+        uses: openai/setup-codex@v1
+        with:
+          api-key: ${{ secrets.CODEX_API_KEY }}
+      - name: Produce review artifact only
+        run: node dist/repair/exact-review.js --publication-policy record_comment_only
+
+  event-review-publish:
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_action == 'exact_review_artifact_publish' && github.event.client_payload.publication_policy == 'record_comment_only' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Mint narrowly scoped reviewer identity token
+        id: reviewer-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-issues: write
+      - name: Publish the verified review comment
+        env:
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+        run: node dist/repair/exact-review-publish.js --record-comment-only

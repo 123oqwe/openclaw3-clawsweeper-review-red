@@ -1,0 +1,32 @@
+name: OpenClaw 3 hosted target admission
+
+on:
+  workflow_call:
+    inputs:
+      target_repository:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Load self-owned target registry
+        env:
+          REGISTRY_REPOSITORY: ${{ github.repository }}
+        run: |
+          test -n "$REGISTRY_REPOSITORY"
+          curl --fail --silent --show-error \
+            "https://raw.githubusercontent.com/$REGISTRY_REPOSITORY/main/config/target-repositories.json" \
+            -o target-repositories.json
+          node dist/hosted-target-admission.js --registry target-repositories.json \
+            --target "${{ inputs.target_repository }}"
+      - name: Mint self-owned admission identity token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
