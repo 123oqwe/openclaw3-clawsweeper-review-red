@@ -251,7 +251,7 @@ jobs:
 
       - uses: ./.github/actions/setup-pnpm
         id: setup-pnpm
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.target.outputs.target_enabled == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
         with:
           build-script: build:all
 
@@ -452,9 +452,9 @@ jobs:
           owner: ${{ steps.target.outputs.target_repo_owner }}
           repositories: ${{ steps.target.outputs.target_repo_name }}
           permission-checks: read
-          permission-contents: write
+          permission-contents: read
           permission-issues: write
-          permission-pull-requests: write
+          permission-pull-requests: read
           permission-statuses: read
 
       - name: Check out target repository
