@@ -93,7 +93,7 @@ fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify({
   schemaArgument: args.includes("--output-schema"),
   promptReceived: input === ${JSON.stringify(prompt)},
   inspectionAsGh: process.env.GH_TOKEN === ${JSON.stringify(inspectionToken)},
-  originalInspectionPresent: Object.hasOwn(process.env, "CLAWSEEPER_PROOF_INSPECTION_TOKEN"),
+  originalInspectionPresent: Object.hasOwn(process.env, "CLAWSWEEPER_PROOF_INSPECTION_TOKEN"),
   forbidden: presence,
 }) + "\\n");
 if (args[0] === "sandbox") {
