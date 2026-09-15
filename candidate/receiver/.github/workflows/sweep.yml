@@ -25,7 +25,6 @@ permissions:
 
 env:
   CLAWSWEEPER_APP_CLIENT_ID: ${{ vars.CLAWSWEEPER_APP_CLIENT_ID }}
-  CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
   EXACT_REVIEW_QUEUE_URL: ${{ vars.EXACT_REVIEW_QUEUE_URL }}
 
 jobs:
@@ -69,6 +68,8 @@ jobs:
   event-review-apply:
     if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' }}
     runs-on: ubuntu-24.04
+    env:
+      CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
     steps:
       - name: Fetch control-plane retry helper
         run: |
