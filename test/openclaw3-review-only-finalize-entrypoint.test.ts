@@ -59,7 +59,7 @@ function step(job: Job | undefined, id: string, label: string): Step {
 }
 function upstreamStep(id: string, job = "event-review-apply"): Step { return step(jobs(upstream)[job], id, `fixed upstream ${job}`); }
 
-async function session(admitted = false, rawDecision: ReviewDecision = decision) {
+async function session(admitted = false, rawDecision: ReviewDecision = decision, trailingQueueUrl = false) {
   const root = mkdtempSync(join(tmpdir(), "oc3-finalizer-entrypoint-"));
   mkdirSync(join(root, "scripts"));
   cpSync("scripts/control-plane-curl.sh", join(root, "scripts/control-plane-curl.sh"));
@@ -118,7 +118,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === ${JSON.stringify(join(r
   const server = createServer(async (request, response) => {
     try {
       assert.equal(request.method, "POST");
-      assert.ok(["/internal/exact-review/claim", "/internal/exact-review/heartbeat", "/internal/exact-review/enqueue", "/internal/exact-review/complete", "/internal/exact-review/lifecycle/terminal-disposition"].includes(request.url || ""), `unexpected fixture route ${request.url}`);
+      const routes = ["/internal/exact-review/claim", "/internal/exact-review/heartbeat", "/internal/exact-review/enqueue", "/internal/exact-review/complete", "/internal/exact-review/lifecycle/terminal-disposition"];
+      // In this configuration only, forward the exact accidental double slash
+      // to the real Worker as well. Never normalize it or fake a route failure.
+      const malformedRoutes = ["//internal/exact-review/heartbeat", "//internal/exact-review/complete", "//internal/exact-review/lifecycle/terminal-disposition"];
+      assert.ok(routes.includes(request.url || "") || (trailingQueueUrl && malformedRoutes.includes(request.url || "")), `unexpected fixture route ${request.url}`);
       let bytes = "";
       for await (const chunk of request) { bytes += chunk; assert.ok(bytes.length < 128 * 1024); }
       const sentRequest = JSON.parse(bytes), forwarded = structuredClone(sentRequest);
@@ -139,7 +143,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === ${JSON.stringify(join(r
   });
   await new Promise<void>((accept) => server.listen(0, "127.0.0.1", accept));
   const address = server.address(); assert.ok(address && typeof address !== "string");
-  const queueUrl = `http://127.0.0.1:${address.port}`;
+  const queueUrl = `http://127.0.0.1:${address.port}${trailingQueueUrl ? "/" : ""}`;
   async function run(actual: Step, values: Outputs, attempt = 1) {
     assert.ok(actual.run);
     const output = join(root, `outputs-${++sequence}`); writeFileSync(output, "");
@@ -206,8 +210,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === ${JSON.stringify(join(r
   }
 }
 type Session = Awaited<ReturnType<typeof session>>;
-async function withSession(use: (s: Session) => Promise<void>, admitted = false, rawDecision: ReviewDecision = decision) {
-  const s = await session(admitted, rawDecision); try { await use(s); } finally { await s.close(); }
+async function withSession(use: (s: Session) => Promise<void>, admitted = false, rawDecision: ReviewDecision = decision, trailingQueueUrl = false) {
+  const s = await session(admitted, rawDecision, trailingQueueUrl); try { await use(s); } finally { await s.close(); }
 }
 
 function stages(claim: Outputs, effectiveDecision: ReviewDecision = decision): Record<string, Stage> {
@@ -215,7 +219,7 @@ function stages(claim: Outputs, effectiveDecision: ReviewDecision = decision): R
   return {
     "claim-exact-review-queue": { outputs: claim, outcome: "success" },
     target: { outputs: { target_enabled: "true", target_repo: effectiveDecision.targetRepo, item_number: "41", has_command_context: "false" }, outcome: "success" },
-    "live-item": { outputs: { decision: JSON.stringify(effectiveDecision), target_branch: "main", proceed: "true", terminal_noop: "false", terminal_missing: "false", guarded_open: "false", admission_retry: "false", scheduled_semantic_noop: "false", retry_kind: "", retry_at: "" }, outcome: "success" },
+    "live-item": { outputs: { decision: JSON.stringify(effectiveDecision), target_branch: effectiveDecision.targetBranch, proceed: "true", terminal_noop: "false", terminal_missing: "false", guarded_open: "false", admission_retry: "false", scheduled_semantic_noop: "false", retry_kind: "", retry_at: "" }, outcome: "success" },
     "reserve-exact-review-lease": { outputs: { status: "posted", owner: `github-run-${runId}-1`, comment_id: "41010", retry_kind: "", retry_at: "" }, outcome: "success" },
     "review-exact-event-item": { outputs: { terminal_during_review: "false", superseded: "false", retry_kind: "", retry_at: "", failure_reason: "", failure_stage: "", failure_reason_code: "", failure_retryable: "" }, outcome: "success" },
     "source-checkout": { outputs: {}, outcome: "success" },
@@ -449,6 +453,8 @@ const extraStages: Record<string, Outputs> = {
 };
 type Scenario = {
   rawBranch?: string; mutateReceipt?: (receipt: Outputs) => void; unclaimed?: boolean;
+  trailingQueueUrl?: boolean;
+  unresolvedBranch?: "coordination" | "throttle";
   held?: "coordination" | "throttle"; model?: "success" | "failure" | "cancelled";
   terminal?: "target_closed" | "target_missing" | "guarded_open" | "policy_noop";
   noAdmission?: boolean; firstLost?: boolean; unknownFirst?: boolean;
@@ -462,9 +468,10 @@ function candidateExpressions(s: Session, inputs: Record<string, Stage>, receipt
   const dispatchDecision = s.owned.decision;
   Object.assign(values, {
     "toJSON(needs.event-review-prepare.outputs)": JSON.stringify(receipt),
-    "needs.event-review-prepare.result": "success", "needs.event-review-apply.result": scenario.model ?? (scenario.held || scenario.terminal || scenario.unclaimed ? "skipped" : "success"),
+    "needs.event-review-prepare.result": "success", "needs.event-review-apply.result": scenario.model ?? (scenario.held || scenario.unresolvedBranch || scenario.terminal || scenario.unclaimed ? "skipped" : "success"),
     "toJSON(steps.finalize-preparation-context.outputs)": JSON.stringify(inputs["finalize-preparation-context"].outputs),
     "vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL": s.queueUrl,
+    "vars.CLAWSWEEPER_ENABLE_CLAWHUB": "",
     "github.run_id": runId, "github.sha": sourceSha, "github.repository": repository,
     "toJSON(github.event.client_payload)": JSON.stringify({ target_repo: dispatchDecision.targetRepo, item_number: 41, source_action: dispatchDecision.sourceAction, publication_policy: dispatchDecision.publicationPolicy, queue_lease_id: s.owned.leaseId, queue_claim: { item_key: itemKey, lease_revision: 1, ...(dispatchDecision.sourceHeadSha ? { source_head_sha: dispatchDecision.sourceHeadSha } : {}) } }),
   });
@@ -479,24 +486,29 @@ function candidateExpressions(s: Session, inputs: Record<string, Stage>, receipt
   return values;
 }
 async function candidateScenario(s: Session, allJobs: Record<string, Job>, scenario: Scenario = {}) {
-  const decision: ReviewDecision = { ...s.owned.decision, targetBranch: "main" };
+  const decision: ReviewDecision = { ...s.owned.decision, targetBranch: scenario.unresolvedBranch ? s.owned.decision.targetBranch : "main" };
   const finalize = allJobs["event-review-finalize"];
   const actual = (id: string) => step(finalize, id, "candidate event-review-finalize");
   const initial = await s.claim(step(allJobs["event-review-prepare"], "claim-exact-review-queue", "candidate prepare"), 1, scenario.unclaimed);
   const inputs = stages(initial, decision);
   for (const [id, outputs] of Object.entries(extraStages)) inputs[id] = { outputs: { ...outputs }, outcome: "skipped" };
-  const retryAt = scenario.held ? new Date(Date.now() + 45 * 60_000).toISOString() : "";
-  const trustedReservation = { status: scenario.held ? "held" : scenario.terminal ? "" : "posted", owner: scenario.held || scenario.terminal ? "" : `github-run-${runId}-1`, comment_id: scenario.held || scenario.terminal ? "" : "41010", head_sha: scenario.held || scenario.terminal ? "" : sourceSha, retry_kind: scenario.held || "", retry_at: retryAt };
+  const retryAt = scenario.held || scenario.unresolvedBranch ? new Date(Date.now() + 45 * 60_000).toISOString() : "";
+  if (scenario.unresolvedBranch) {
+    Object.assign(inputs["live-item"].outputs, { proceed: "false", admission_retry: "true", retry_kind: scenario.unresolvedBranch, retry_at: retryAt });
+    inputs["reserve-exact-review-lease"] = { outcome: "skipped", outputs: {} };
+  }
+  const noReservation = scenario.held || scenario.terminal || scenario.unresolvedBranch;
+  const trustedReservation = { status: scenario.held ? "held" : noReservation ? "" : "posted", owner: noReservation ? "" : `github-run-${runId}-1`, comment_id: noReservation ? "" : "41010", head_sha: noReservation ? "" : sourceSha, retry_kind: scenario.held || "", retry_at: scenario.held ? retryAt : "" };
   // Trusted preparation transport is synthetic, but its claim was just obtained
   // from the actual Queue. Actual prepare output mappings supply needs strings.
   const preparationValues: Outputs = {};
   const claimOutputs = { ...Object.fromEntries(["claimed", "protocol_version", "item_key", "lease_id", "lease_revision", "claim_generation", "decision", "repeat_revision"].map((key) => [key, ""])), ...initial };
   const reservationOutputs = scenario.unclaimed ? Object.fromEntries(Object.keys(trustedReservation).map((key) => [key, ""])) : trustedReservation;
-  for (const [id, outputs] of Object.entries({ "claim-exact-review-queue": claimOutputs, "live-item": { decision: scenario.unclaimed ? "" : JSON.stringify(decision), retry_kind: "", retry_at: "" }, "reserve-exact-review-lease": reservationOutputs })) {
+  for (const [id, outputs] of Object.entries({ "claim-exact-review-queue": claimOutputs, "live-item": { decision: scenario.unclaimed ? "" : JSON.stringify(decision), retry_kind: scenario.unresolvedBranch || "", retry_at: scenario.unresolvedBranch ? retryAt : "" }, "reserve-exact-review-lease": reservationOutputs })) {
     for (const [key, value] of Object.entries(outputs)) preparationValues[`steps.${id}.outputs.${key}`] = value;
   }
-  preparationValues["steps.live-item.outputs.retry_kind || steps.reserve-exact-review-lease.outputs.retry_kind"] = trustedReservation.retry_kind;
-  preparationValues["steps.live-item.outputs.retry_at || steps.reserve-exact-review-lease.outputs.retry_at"] = trustedReservation.retry_at;
+  preparationValues["steps.live-item.outputs.retry_kind || steps.reserve-exact-review-lease.outputs.retry_kind"] = scenario.unresolvedBranch || trustedReservation.retry_kind;
+  preparationValues["steps.live-item.outputs.retry_at || steps.reserve-exact-review-lease.outputs.retry_at"] = retryAt;
   const receipt = Object.fromEntries(Object.entries(allJobs["event-review-prepare"].outputs || {}).map(([key, expression]) => [key, render(expression, preparationValues)]));
   scenario.mutateReceipt?.(receipt);
   async function execute(id: string) {
@@ -570,13 +582,15 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
   assert.deepEqual(claimed.outputs, initial, "same attempt may not replace the prepared generation or raw decision");
   // Fresh state classification is explicitly covered by R02's actual shell/gh
   // suite. This fixture supplies its frozen output, not model-controlled flags.
-  inputs["fresh-finalize-live"] = { outcome: "success", outputs: {
+  // The actual producer retry outputs are independently exercised in the GH
+  // suite. The frozen fresh guard skips known preparation deferral and held.
+  inputs["fresh-finalize-live"] = scenario.held || scenario.unresolvedBranch ? { outcome: "skipped", outputs: {} } : { outcome: "success", outputs: {
     proceed: scenario.terminal ? "false" : "true", terminal_noop: scenario.terminal ? "true" : "false",
     terminal_missing: scenario.terminal === "target_missing" ? "true" : "false", guarded_open: scenario.terminal === "guarded_open" ? "true" : "false",
     admission_retry: "false", retry_kind: "", retry_at: "", target_branch: "main", decision: JSON.stringify(decision),
     terminal_disposition: scenario.terminal || "", head_sha: sourceSha,
   } };
-  if (!scenario.held && !scenario.terminal && (!scenario.model || scenario.model === "success")) {
+  if (!scenario.held && !scenario.unresolvedBranch && !scenario.terminal && (!scenario.model || scenario.model === "success")) {
     const created = await runStage(s, inputs, step(allJobs["event-review-apply"], "create-exact-review-bundle", "candidate model"));
     assert.equal(created.code, 0, created.stderr); assert.deepEqual(s.cliCommands(), ["create"]);
     const directory = join(s.root, ".artifacts/exact-review-bundle"), manifestPath = join(directory, "manifest.json");
@@ -585,7 +599,10 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
       if (scenario.corruptBundle === "producer") manifest.workflow.run_id = "99999999";
       if (scenario.corruptBundle === "decision") manifest.review.decision_sha256 = "f".repeat(64);
-      if (scenario.corruptBundle === "terminal") manifest.review.live_proceeded = false;
+      if (scenario.corruptBundle === "terminal") {
+        manifest.review.live_proceeded = false;
+        manifest.review.live_terminal_noop = true;
+      }
       writeFileSync(manifestPath, JSON.stringify(manifest));
     }
     const validated = await execute("validate-finalize-bundle");
@@ -618,13 +635,20 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
   assert.equal(s.trace.at(-1)?.status, 200);
   if (scenario.terminal) {
     const recorded = await execute("record-finalize-terminal");
-    assert.equal(recorded.code, scenario.noAdmission ? 1 : 0, recorded.stderr);
+    if (scenario.noAdmission) assert.notEqual(recorded.code, 0, recorded.stderr);
+    else assert.equal(recorded.code, 0, recorded.stderr);
     assert.equal(s.trace.at(-1)?.path, "/internal/exact-review/lifecycle/terminal-disposition");
     assert.equal(s.trace.at(-1)?.signed, true);
     assert.deepEqual(s.trace.at(-1)?.request, { canonical_target_key: itemKey, fence_key: itemKey, revision: 1, kind: scenario.terminal });
-    if (scenario.noAdmission) assert.deepEqual(s.trace.at(-1)?.response, { error: "invalid_lifecycle_terminal_disposition" });
+    if (scenario.noAdmission) {
+      assert.equal(s.trace.at(-1)?.status, 409);
+      assert.deepEqual(s.trace.at(-1)?.response, { error: "invalid_lifecycle_terminal_disposition" });
+      assert.notEqual(recorded.outputs.recorded, "true");
+      assert.equal(new ExactReviewLifecycleProjectionStore(s.storage).read(itemKey, itemKey, 1), null);
+      assert.equal((await s.publications()).length, 0);
+    }
     else { assert.equal(s.trace.at(-1)?.status, 200); assert.equal(s.trace.at(-1)?.response.lifecycle_state, scenario.terminal); assert.equal(recorded.outputs.recorded, "true"); assert.equal(recorded.outputs.terminal_disposition, scenario.terminal); }
-  } else if (!scenario.held && (!scenario.model || scenario.model === "success") && !scenario.corruptBundle) {
+  } else if (!scenario.held && !scenario.unresolvedBranch && (!scenario.model || scenario.model === "success") && !scenario.corruptBundle) {
     if (scenario.deniedEnqueue) s.workerEnv.CLAWSWEEPER_WEBHOOK_SECRET = "synthetic-different-verifier-secret";
     const queued = await execute("queue-exact-review-publication");
     assert.equal(queued.code, scenario.deniedEnqueue ? 1 : 0, queued.stderr);
@@ -650,15 +674,23 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
     assert.equal((await s.state()).items[itemKey].claimGeneration, 2);
   } else {
     assert.equal(done.completed?.code, 0, done.completed?.stderr); assert.equal(s.trace.at(-1)?.status, 200);
-    if (scenario.held || scenario.corruptBundle || scenario.noAdmission || scenario.deniedEnqueue || scenario.model === "failure" || scenario.model === "cancelled") {
+    if (scenario.held || scenario.unresolvedBranch || scenario.corruptBundle || scenario.noAdmission || scenario.deniedEnqueue || scenario.model === "failure" || scenario.model === "cancelled") {
       const pending = (await s.state()).items[itemKey]; assert.equal(pending.state, "pending"); assert.equal(pending.leaseId, undefined);
-      if (scenario.held || scenario.corruptBundle || scenario.noAdmission) {
-        assert.equal(done.result.outputs.retry_kind, scenario.held || "coordination");
+      if (scenario.held || scenario.unresolvedBranch || scenario.corruptBundle || scenario.noAdmission) {
+        assert.equal(done.result.outputs.retry_kind, scenario.held || scenario.unresolvedBranch || "coordination");
         assert.ok(Date.parse(done.result.outputs.retry_at) > Date.now());
         assert.equal(pending.attempts, s.owned.attempts); assert.equal(pending.reviewFailureAttempts || 0, s.owned.reviewFailureAttempts || 0);
       }
       assert.equal(done.result.outputs.outcome, scenario.model === "cancelled" ? "cancelled" : "failure");
       assert.equal((await s.publications()).length, 0);
+      if (scenario.unresolvedBranch) {
+        assert.deepEqual(JSON.parse(receipt.effective_decision), s.owned.decision, "unresolved branch authority stays raw");
+        assert.equal(receipt.reservation_status, ""); assert.equal(inputs["fresh-finalize-live"].outcome, "skipped");
+        assert.equal(done.result.outputs.retry_at, receipt.retry_at); assert.equal(done.result.outputs.cleanup_mode, "none");
+        assert.deepEqual(s.cliCommands(), [], "skipped model path cannot build or validate a bundle");
+        assert.ok(s.trace.every((entry) => !entry.signed), "preparation deferral cannot sign any handoff");
+        assert.deepEqual(s.trace.map((entry) => entry.path), ["claim", "heartbeat", "claim", "heartbeat", "complete"].map((path) => `/internal/exact-review/${path}`));
+      }
     } else {
       assert.equal(done.result.outputs.outcome, "success"); assert.equal((await s.state()).items[itemKey], undefined);
       assert.equal(done.result.outputs.cleanup_mode, scenario.terminal ? "none" : "expire");
@@ -681,7 +713,10 @@ test("R06-B candidate actual trusted finalizer against real Worker/Queue", async
   for (const id of ["finalize-preparation-context", "fence-finalize-authority", "claim-finalize-authority", "validate-finalize-bundle", "fence-finalize-handoff", "queue-exact-review-publication", "record-finalize-terminal", "exact-review-generation-result", "complete-exact-review-queue", "fail-finalize"]) step(finalize, id, "candidate event-review-finalize");
   const cases: Array<[string, Scenario]> = [
     ["accepted publication replay remains one durable item", {}],
+    ["trailing queue URL preserves exact routes for signed enqueue and completion", { trailingQueueUrl: true }],
+    ["trailing queue URL preserves exact routes for signed terminal and completion", { trailingQueueUrl: true, terminal: "target_closed" }],
     ["effective branch correction preserves raw Queue authority", { rawBranch: "41" }],
+    ["unresolved preparation branch defers with raw authority and releases the lease", { rawBranch: "41", unresolvedBranch: "coordination" }],
     ["legitimate unclaimed receipt is a no-op", { unclaimed: true }],
     ["first real heartbeat loses without taking over the newer generation", { firstLost: true }],
     ["unknown first-fence conflict cannot become a safe no-op", { firstLost: true, unknownFirst: true }],
@@ -699,7 +734,7 @@ test("R06-B candidate actual trusted finalizer against real Worker/Queue", async
     ["missing lifecycle admission cannot become terminal success", { terminal: "target_closed", noAdmission: true }],
   ];
   for (const [name, scenario] of cases) await t.test(name, async () => {
-    await withSession(async (s) => { await candidateScenario(s, allJobs, scenario); }, !scenario.noAdmission, { ...decision, targetBranch: scenario.rawBranch || "main" });
+    await withSession(async (s) => { await candidateScenario(s, allJobs, scenario); }, !scenario.noAdmission, { ...decision, targetBranch: scenario.rawBranch || "main" }, scenario.trailingQueueUrl);
   });
   for (const [name, scenario] of [
     ["normally admitted PR carries source head through both fences and publication", {}],
@@ -714,5 +749,12 @@ test("R06-B candidate actual trusted finalizer against real Worker/Queue", async
     ["malformed trusted retry", (r: Outputs) => { r.retry_kind = "throttle"; r.retry_at = "not-a-timestamp"; }],
   ] as Array<[string, (receipt: Outputs) => void]>) await t.test(`context rejects ${name} before first Queue operation`, async () => {
     await withSession(async (s) => { await candidateScenario(s, allJobs, { mutateReceipt }); }, true);
+  });
+  for (const [name, mutateReceipt] of [
+    ["unresolved branch without typed retry", (r: Outputs) => { r.retry_kind = ""; r.retry_at = ""; }],
+    ["unresolved branch with a posted reservation", (r: Outputs) => { r.reservation_status = "posted"; r.reservation_owner = `github-run-${runId}-1`; r.reservation_comment_id = "41010"; r.reservation_head_sha = sourceSha; }],
+    ["missing effective decision is not a retry fallback", (r: Outputs) => { r.effective_decision = ""; }],
+  ] as Array<[string, (receipt: Outputs) => void]>) await t.test(`context rejects ${name}`, async () => {
+    await withSession(async (s) => { await candidateScenario(s, allJobs, { rawBranch: "41", unresolvedBranch: "coordination", mutateReceipt }); }, true, { ...decision, targetBranch: "41" });
   });
 });

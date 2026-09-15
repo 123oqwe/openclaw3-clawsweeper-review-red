@@ -82,7 +82,7 @@ test("R06-B finalizer waits for both jobs and fences old authority before claim 
   assert.doesNotMatch(JSON.stringify({ workflowEnv: sweep.env, jobEnv: j.env }), /secrets\.|private-key|WEBHOOK_SECRET|RECORDS_SECRET|target-write-token|toJSON\(secrets|secrets\[/);
   const c = step(j, "finalize-preparation-context"), fence = step(j, "fence-finalize-authority"), claim = step(j, "claim-finalize-authority");
   if (c.if !== undefined) guard(c.if, ["always()"]);
-  env(c, { PREPARATION_RECEIPT: expr("toJSON(needs.event-review-prepare.outputs)"), PREPARE_RESULT: expr("needs.event-review-prepare.result"), MODEL_RESULT: expr("needs.event-review-apply.result") });
+  env(c, { PREPARATION_RECEIPT: expr("toJSON(needs.event-review-prepare.outputs)"), PREPARE_RESULT: expr("needs.event-review-prepare.result"), MODEL_RESULT: expr("needs.event-review-apply.result"), CLAWHUB_ENABLED: expr("vars.CLAWSWEEPER_ENABLE_CLAWHUB") });
   before(j, c, fence); before(j, fence, claim); guard(fence.if, [claimed]); guard(claim.if, [first], [claimed]);
   const fenceEnv = { PREPARATION_CONTEXT: expr("toJSON(steps.finalize-preparation-context.outputs)"), QUEUE_URL: queue, RUN_ATTEMPT: expr("github.run_attempt") };
   env(fence, fenceEnv); env(step(j, "fence-finalize-handoff"), fenceEnv);
@@ -101,8 +101,8 @@ test("R06-B trusted build and fresh live supply bundle expectations before signe
   const j = job(), claim = step(j, "claim-finalize-authority"), live = step(j, "fresh-finalize-live");
   const download = step(j, "download-finalize-bundle"), validate = step(j, "validate-finalize-bundle"), fence = step(j, "fence-finalize-handoff");
   const { build } = sourceBuild(j, claim, download); before(j, build, live); before(j, live, download); before(j, download, validate); before(j, validate, fence);
-  guard(live.if, [current], [first, claimed, buildSuccess]);
-  env(live, { CLAIM_DECISION: context("decision"), RAW_CLAIM_DECISION: context("raw_decision"), TARGET_REPO: context("target_repo"), ITEM_NUMBER: context("item_number"), CLAIM_TARGET_BRANCH: context("target_branch"), RESERVATION_HEAD_SHA: context("reservation_head_sha"), GH_TOKEN: expr("secrets.CLAWSWEEPER_TARGET_READ_TOKEN") });
+  guard(live.if, [current, `${C}.retry_kind == ''`], [first, claimed, buildSuccess]);
+  env(live, { CLAIM_DECISION: context("decision"), RAW_CLAIM_DECISION: context("raw_decision"), TARGET_REPO: context("target_repo"), ITEM_NUMBER: context("item_number"), CLAIM_TARGET_BRANCH: context("target_branch"), RESERVATION_HEAD_SHA: context("reservation_head_sha"), GH_TOKEN: expr("secrets.CLAWSWEEPER_TARGET_READ_TOKEN"), CLAWHUB_ENABLED: expr("vars.CLAWSWEEPER_ENABLE_CLAWHUB") });
   const eligible = [current, posted, modelSuccess, fresh, proceed, noRetry];
   guard(download.if, eligible, [first, claimed, buildSuccess, "!cancelled()"]);
   assert.equal(download.uses, "actions/download-artifact@v8");

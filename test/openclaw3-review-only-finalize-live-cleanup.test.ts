@@ -19,8 +19,8 @@ const started = (leaseOwner = owner, sha = head) => `<!-- clawsweeper-review-sta
 const body = `${"Review in progress."}\n\n${started()}\n<!-- clawsweeper-review-lease item=41 -->`;
 const comment = { id, body, user: { login: "clawsweeper[bot]" } };
 const firstCommentPage = Array.from({ length: 100 }, (_, index) => ({ ...comment, id: id + index + 1 }));
-type Step = { run?: string; env?: Record<string, unknown> };
-type Scenario = { itemStatus?: number; repoStatus?: number; pullStatus?: number; state?: string; locked?: boolean; head?: string; branch?: string; comments?: unknown[]; commentPages?: unknown[][]; commentsStatus?: number; secondPageStatus?: number; writeStatus?: number };
+type Step = { run?: string; env?: Record<string, unknown>; if?: unknown };
+type Scenario = { repository?: "openclaw/clawhub"; itemStatus?: number; repoStatus?: number; pullStatus?: number; state?: string; locked?: boolean; head?: string; branch?: string; comments?: unknown[]; commentPages?: unknown[][]; commentsStatus?: number; secondPageStatus?: number; writeStatus?: number };
 type Trace = { method: string; path: string; body?: unknown };
 const compact = (s: string) => s.replace(/\s+/g, "");
 function actualStep(path: string, job: string, id: string): Step {
@@ -74,8 +74,9 @@ let payload;
 if(input) { try { payload=JSON.parse(fs.readFileSync(input==='-'?0:input,'utf8')); } catch { bad('invalid JSON input'); } }
 else if(Object.keys(fields).length) payload=fields;
 fs.appendFileSync(${JSON.stringify(tracePath)}, JSON.stringify({method,path:endpoint,body:payload})+'\\n');
-const base=${JSON.stringify(`repos/${repo}`)}; let status=200, value, commentResult=false;
-if(method==='GET'&&endpoint===base) { status=s.repoStatus||200; value={full_name:${JSON.stringify(repo)},private:false,visibility:'public',default_branch:s.branch||'main'}; }
+if(s.repository && s.repository!=='openclaw/clawhub') bad('unfrozen repository fixture');
+const fixtureRepo=s.repository||${JSON.stringify(repo)}, base='repos/'+fixtureRepo; let status=200, value, commentResult=false;
+if(method==='GET'&&endpoint===base) { status=s.repoStatus||200; value={full_name:fixtureRepo,private:false,visibility:'public',default_branch:s.branch||'main'}; }
 else if(method==='GET'&&endpoint===base+'/issues/41') { status=s.itemStatus||200; value={number:41,state:s.state||'open',locked:!!s.locked,pull_request:{url:'https://api.github.com/'+base+'/pulls/41'}}; }
 else if(method==='GET'&&endpoint===base+'/pulls/41') { status=s.pullStatus||200; value={number:41,state:s.state||'open',head:{sha:s.head||${JSON.stringify(head)}},base:{ref:'main'},additions:1,deletions:1,changed_files:1}; }
 else if(method==='GET'&&(endpoint===base+'/issues/41/comments'||endpoint===base+'/issues/41/comments?per_page=100')) {
@@ -90,7 +91,7 @@ else if(method==='GET'&&(endpoint===base+'/issues/41/comments'||endpoint===base+
  }
  value=slurp?visible:visible.map(page=>JSON.stringify(page)).join('\\n');
 }
-else if(['PATCH','DELETE'].includes(method)&&endpoint===base+'/issues/comments/${id}') { status=s.writeStatus||200; value=method==='PATCH'?{id:${id},body:payload?.body}:{}; }
+else if(!s.repository&&['PATCH','DELETE'].includes(method)&&endpoint===base+'/issues/comments/${id}') { status=s.writeStatus||200; value=method==='PATCH'?{id:${id},body:payload?.body}:{}; }
 else bad('unallowed endpoint '+method+' '+endpoint);
 if(status!==200) { process.stderr.write(status===429?'HTTP 429 rate limit exceeded':status===404?'HTTP 404 Not Found':'HTTP '+status+' denied'); process.exit(1); }
 if(jq) { if(jq!=='.default_branch // empty') bad('unfrozen jq '+jq); process.stdout.write(String(value.default_branch||'')); }
@@ -126,7 +127,7 @@ function contextValues(overrides: Record<string, string> = {}) {
   const context = { decision: JSON.stringify(decision), raw_decision: JSON.stringify(decision), target_repo: repo, item_number: item, target_branch: "main", reservation_status: "posted", reservation_owner: owner, reservation_comment_id: String(id), reservation_head_sha: head, ...overrides };
   return Object.fromEntries(Object.entries(context).map(([k, v]) => [`steps.finalize-preparation-context.outputs.${k}`, v]));
 }
-const readValues = (overrides: Record<string, string> = {}) => ({ ...contextValues(overrides), "secrets.CLAWSWEEPER_TARGET_READ_TOKEN": "synthetic-read-only" });
+const readValues = (overrides: Record<string, string> = {}) => ({ ...contextValues(overrides), "secrets.CLAWSWEEPER_TARGET_READ_TOKEN": "synthetic-read-only", "vars.CLAWSWEEPER_ENABLE_CLAWHUB": "" });
 const noTerminal = (out: Record<string, string>) => {
   assert.notEqual(out.terminal_noop, "true"); assert.notEqual(out.terminal_missing, "true");
   assert.notEqual(out.guarded_open, "true"); assert.ok(!out.terminal_disposition);
@@ -146,6 +147,44 @@ test("R06-B real marker controls and fixed upstream live run establish the GH fi
     const positive = s.run(control, values);
     assert.equal(positive.code, 0, positive.stderr); assert.equal(positive.out.proceed, "true");
     assert.deepEqual(positive.trace.map((r) => r.path), [`repos/${repo}/issues/41`, `repos/${repo}/pulls/41`]);
+  } finally { s.close(); }
+});
+
+test("R06-B prepare live exports raw authority and a typed deferral when default branch cannot resolve", async (t) => {
+  const step = actualStep(candidate, "event-review-prepare", "live-item"), s = runtime(true);
+  const raw = { ...decision, targetBranch: "41" };
+  const values = {
+    "steps.claim-exact-review-queue.outputs.decision": JSON.stringify(raw),
+    "steps.target.outputs.target_repo == 'openclaw/openclaw' && github.token || steps.target-read-token.outputs.token": "synthetic-read-only",
+    "steps.target.outputs.target_repo": repo,
+    "steps.target.outputs.item_number": item,
+    "fromJSON(steps.claim-exact-review-queue.outputs.decision).targetBranch": raw.targetBranch,
+  };
+  assert.deepEqual(Object.keys(step.env || {}).sort(), ["CLAIM_DECISION", "GH_TOKEN", "TARGET_REPO", "ITEM_NUMBER", "CLAIM_TARGET_BRANCH"].sort());
+  try {
+    await t.test("successful resolution control uses the actual prepare live run", () => {
+      const r = s.run(step, values);
+      assert.equal(r.code, 0, r.stderr); assert.equal(r.out.proceed, "true");
+      assert.equal(r.out.admission_retry, "false"); assert.equal(r.out.target_branch, "main");
+      assert.deepEqual(JSON.parse(r.out.decision), decision);
+      assert.deepEqual(r.trace.map((entry) => entry.path), [`repos/${repo}`, `repos/${repo}/issues/41`, `repos/${repo}/pulls/41`]);
+    });
+    for (const [name, scenario] of [
+      ["repository read denied", { repoStatus: 403 }],
+      ["repository read throttled", { repoStatus: 429 }],
+      ["repository returns another unusable branch", { branch: "42" }],
+    ] as const) await t.test(name, () => {
+      const r = s.run(step, values, scenario);
+      assert.equal(r.code, 0, r.stderr); assert.equal(r.out.proceed, "false"); noTerminal(r.out);
+      assert.equal(r.out.admission_retry, "true");
+      assert.ok(("repoStatus" in scenario && scenario.repoStatus === 429 ? ["coordination", "throttle"] : ["coordination"]).includes(r.out.retry_kind));
+      assert.ok(Number.isFinite(Date.parse(r.out.retry_at)) && Date.parse(r.out.retry_at) > Date.now());
+      assert.equal(typeof r.out.decision, "string", "retry must export the original authorized decision");
+      assert.deepEqual(JSON.parse(r.out.decision), raw);
+      assert.equal(r.out.target_branch, raw.targetBranch, "a failed read cannot fabricate a resolved branch");
+      assert.notEqual(r.out.status, "posted"); assert.notEqual(r.out.reservation_status, "posted");
+      assert.deepEqual(r.trace.map(({ method, path }) => ({ method, path })), [{ method: "GET", path: `repos/${repo}` }]);
+    });
   } finally { s.close(); }
 });
 
@@ -236,5 +275,103 @@ test("R06-B candidate cleanup fences the exact canonical owner/head snapshot", a
       await t.test(name, () => { const r = s.run(step, v, { comments: [comment] }); assert.equal(r.code, 0, r.stderr); assert.equal(r.out.status, "skipped"); assert.deepEqual(r.trace, []); });
     for (const [name, scenario] of [["read failure", { comments: [comment], commentsStatus: 403 }], ["write failure", { comments: [comment], writeStatus: 403 }]] as const)
       await t.test(name, () => { const r = s.run(step, values("expire"), scenario); assert.notEqual(r.code, 0); assert.ok(!r.out.status, "failed transport cannot announce cleanup success"); });
+  } finally { s.close(); }
+});
+
+test("R06-B disabled ClawHub uses the actual resolver, narrow context exception and zero-read policy no-op", async (t) => {
+  const s = runtime(true);
+  const clawhub = { ...decision, targetRepo: "openclaw/clawhub" };
+  const resolverValues = (flag: string, raw: Record<string, unknown> = clawhub) => ({
+    "steps.claim-exact-review-queue.outputs.decision": JSON.stringify(raw),
+    "vars.CLAWSWEEPER_ENABLE_CLAWHUB": flag,
+    "vars.CLAWSWEEPER_CODEX_TIMEOUT_MS || '1200000'": "1200000",
+  });
+  try {
+    // Run the fixed upstream producer first. A failed source control makes this
+    // parent invalid as product RED, independently of candidate topology.
+    const upstreamResolver = actualStep(upstream, "event-review-apply", "target");
+    for (const flag of ["", "1"]) {
+      const control = s.run(upstreamResolver, resolverValues(flag));
+      assert.equal(control.code, 0, control.stderr); assert.deepEqual(control.trace, []);
+      assert.equal(control.out.target_enabled, String(flag === "1"));
+    }
+    const allJobs = YAML.parse(readFileSync(candidate, "utf8")).jobs;
+    const prepare = allJobs["event-review-prepare"];
+    const resolver = actualStep(candidate, "event-review-prepare", "target");
+    const context = actualStep(candidate, "event-review-finalize", "finalize-preparation-context");
+    const fresh = actualStep(candidate, "event-review-finalize", "fresh-finalize-live");
+    const disabled = s.run(resolver, resolverValues(""));
+    assert.equal(disabled.code, 0, disabled.stderr); assert.equal(disabled.out.target_enabled, "false");
+    assert.equal(disabled.out.target_repo, clawhub.targetRepo); assert.deepEqual(disabled.trace, []);
+    // This is the retained two-atom gate, not a general Actions interpreter.
+    const live = actualStep(candidate, "event-review-prepare", "live-item");
+    const atoms = compact(String(live.if)).replace(/^\$\{\{/, "").replace(/\}\}$/, "").split("&&");
+    assert.deepEqual(atoms.sort(), ["steps.claim-exact-review-queue.outputs.claimed=='true'", "steps.target.outputs.target_enabled=='true'"].sort());
+
+    // The claim/reservation transport below is deliberately synthetic. The real
+    // resolver's false output selects a skipped live step, hence empty live and
+    // reservation outputs. This layer does not claim a real Queue lease, reserve
+    // comment, job scheduler or whole-workflow completion.
+    const claim = { claimed: "true", protocol_version: "2", item_key: `${clawhub.targetRepo}#41`, lease_id: "synthetic-prepared-lease", lease_revision: "1", claim_generation: "1", decision: JSON.stringify(clawhub) };
+    const mappingValues: Record<string, string> = {};
+    for (const [key, value] of Object.entries(claim)) mappingValues[`steps.claim-exact-review-queue.outputs.${key}`] = value;
+    for (const key of ["decision", "retry_kind", "retry_at"]) mappingValues[`steps.live-item.outputs.${key}`] = "";
+    for (const key of ["status", "owner", "comment_id", "head_sha", "retry_kind", "retry_at"]) mappingValues[`steps.reserve-exact-review-lease.outputs.${key}`] = "";
+    for (const key of ["retry_kind", "retry_at"]) mappingValues[`steps.live-item.outputs.${key} || steps.reserve-exact-review-lease.outputs.${key}`] = "";
+    const receipt = Object.fromEntries(Object.entries(prepare.outputs || {}).map(([key, value]) => [key, render(value, mappingValues)]));
+    assert.equal(Object.keys(receipt).length, 14); assert.equal(receipt.effective_decision, "");
+    for (const key of ["reservation_status", "reservation_owner", "reservation_comment_id", "reservation_head_sha", "retry_kind", "retry_at"]) assert.equal(receipt[key], "");
+    const contextValuesFor = (p: Record<string, string>, flag = "", model = "skipped", prepared = "success") => ({
+      "toJSON(needs.event-review-prepare.outputs)": JSON.stringify(p),
+      "needs.event-review-prepare.result": prepared, "needs.event-review-apply.result": model,
+      "vars.CLAWSWEEPER_ENABLE_CLAWHUB": flag,
+    });
+    const freshValuesFor = (out: Record<string, string>, flag = "") => ({
+      ...Object.fromEntries(Object.entries(out).map(([key, value]) => [`steps.finalize-preparation-context.outputs.${key}`, value])),
+      "secrets.CLAWSWEEPER_TARGET_READ_TOKEN": "synthetic-read-only", "vars.CLAWSWEEPER_ENABLE_CLAWHUB": flag,
+    });
+    const restored = s.run(context, contextValuesFor(receipt));
+    assert.equal(restored.code, 0, restored.stderr); assert.equal(restored.out.claimed, "true");
+    assert.deepEqual(JSON.parse(restored.out.raw_decision), clawhub); assert.deepEqual(JSON.parse(restored.out.decision), clawhub);
+    assert.equal(Object.keys(restored.out).length, 20); assert.deepEqual(restored.trace, []);
+    const noOp = s.run(fresh, freshValuesFor(restored.out), { repository: "openclaw/clawhub" });
+    assert.equal(noOp.code, 0, noOp.stderr); assert.equal(noOp.out.proceed, "false");
+    assert.equal(noOp.out.terminal_disposition, "policy_noop"); assert.deepEqual(noOp.trace, [], "disabled means no target GH reads, not merely no model");
+
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const rejections: Array<{ name: string; patch?: Record<string, string>; flag?: string; model?: string; prepared?: string }> = [
+      { name: "enabled ClawHub cannot invent effective decision", flag: "1" },
+      { name: "different target cannot use disabled fallback", patch: { decision: JSON.stringify(decision), item_key: `${repo}#41` } },
+      { name: "model success cannot use disabled fallback", model: "success" },
+      { name: "prepare failure cannot use disabled fallback", prepared: "failure" },
+      { name: "posted receipt cannot use disabled fallback", patch: { reservation_status: "posted", reservation_owner: owner, reservation_comment_id: String(id), reservation_head_sha: head } },
+      { name: "residual owner is not an empty reservation", patch: { reservation_owner: owner } },
+      { name: "residual comment is not an empty reservation", patch: { reservation_comment_id: String(id) } },
+      { name: "residual head is not an empty reservation", patch: { reservation_head_sha: head } },
+      { name: "typed retry is not disabled skip", patch: { retry_kind: "coordination", retry_at: future } },
+      { name: "branch-resolution retry_at alone is not disabled skip", patch: { retry_at: future } },
+    ];
+    for (const scenario of rejections) await t.test(scenario.name, () => {
+      const r = s.run(context, contextValuesFor({ ...receipt, ...scenario.patch }, scenario.flag, scenario.model, scenario.prepared));
+      assert.notEqual(r.code, 0); assert.notEqual(r.out.claimed, "true"); assert.deepEqual(r.trace, []);
+    });
+    await t.test("enabled ClawHub with actual effective decision performs normal reads", () => {
+      const enabled = s.run(resolver, resolverValues("1")); assert.equal(enabled.code, 0, enabled.stderr); assert.equal(enabled.out.target_enabled, "true");
+      const r = s.run(context, contextValuesFor({ ...receipt, effective_decision: JSON.stringify(clawhub) }, "1"));
+      assert.equal(r.code, 0, r.stderr);
+      const live = s.run(fresh, freshValuesFor(r.out, "1"), { repository: "openclaw/clawhub" });
+      assert.equal(live.code, 0, live.stderr); assert.equal(live.out.proceed, "true"); noTerminal(live.out);
+      assert.deepEqual(live.trace.map(({ method, path }) => ({ method, path })), [
+        { method: "GET", path: "repos/openclaw/clawhub/issues/41" }, { method: "GET", path: "repos/openclaw/clawhub/pulls/41" },
+      ]);
+    });
+    for (const command of [{ commandStatusMarker: "<!-- clawsweeper-command-status:review:test -->" }, { statusCommentId: 123 }])
+      await t.test(`disabled command context rejects ${Object.keys(command)[0]} before GH`, () => {
+        const d = { ...clawhub, ...command };
+        const r = s.run(context, contextValuesFor({ ...receipt, decision: JSON.stringify(d) }));
+        assert.equal(r.code, 0, r.stderr);
+        const live = s.run(fresh, freshValuesFor(r.out), { repository: "openclaw/clawhub" });
+        assert.notEqual(live.code, 0); assert.ok(!live.out.terminal_disposition); assert.deepEqual(live.trace, []);
+      });
   } finally { s.close(); }
 });
