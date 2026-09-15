@@ -44,3 +44,11 @@ jobs:
       - name: Run planner-owned public visibility probe contracts
         if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
         run: node --test test/openclaw3-review-only-admission-probe.test.ts
+      - name: Run planner-owned real executor handoff and lease lifecycle
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        env:
+          OC3_REVIEW_CANDIDATE_DIR: candidate/receiver
+        run: >-
+          node --test
+          test/openclaw3-review-only-executor-topology.test.ts
+          test/openclaw3-review-only-executor-handoff.test.ts
