@@ -79,6 +79,10 @@ jobs:
       reservation_status: ${{ steps.reserve-exact-review-lease.outputs.status }}
       reservation_owner: ${{ steps.reserve-exact-review-lease.outputs.owner }}
       reservation_comment_id: ${{ steps.reserve-exact-review-lease.outputs.comment_id }}
+      effective_decision: ${{ steps.live-item.outputs.decision }}
+      retry_kind: ${{ steps.live-item.outputs.retry_kind || steps.reserve-exact-review-lease.outputs.retry_kind }}
+      retry_at: ${{ steps.live-item.outputs.retry_at || steps.reserve-exact-review-lease.outputs.retry_at }}
+      reservation_head_sha: ${{ steps.reserve-exact-review-lease.outputs.head_sha }}
     steps:
       - name: Fetch control-plane retry helper
         run: |
@@ -533,12 +537,15 @@ jobs:
           if (reservation.status === "posted") {
             const owner = String(reservation.owner || "");
             const commentId = Number(reservation.commentId);
+            const headSha = String(reservation.headSha || "");
+            if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(headSha)) process.exit(1);
             if (!/^[a-zA-Z0-9._-]{1,200}$/.test(owner) || !Number.isInteger(commentId) || commentId <= 0) {
               process.exit(1);
             }
             append("status", "posted");
             append("owner", owner);
             append("comment_id", String(commentId));
+            append("head_sha", headSha);
             process.exit(0);
           }
           if (reservation.status === "held") {
@@ -1354,6 +1361,600 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
+
+  event-review-finalize:
+    needs: [event-review-prepare, event-review-apply]
+    if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - id: finalize-preparation-context
+        if: ${{ always() }}
+        env:
+          PREPARATION_RECEIPT: "${{ toJSON(needs.event-review-prepare.outputs) }}"
+          PREPARE_RESULT: "${{ needs.event-review-prepare.result }}"
+          MODEL_RESULT: "${{ needs.event-review-apply.result }}"
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { isDeepStrictEqual } = require('node:util');
+          try {
+            const p = JSON.parse(process.env.PREPARATION_RECEIPT || '{}');
+            const out = (o) => fs.appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(o).map(([k,v]) => k+'='+v+'\n').join(''));
+            const scalar = (v) => typeof v === 'string' && !/[\r\n]/.test(v);
+            if (!p || Array.isArray(p) || typeof p !== 'object' || !Object.values(p).every(scalar)) throw Error();
+            const positive = (v) => /^[1-9]\d*$/.test(v) && Number.isSafeInteger(Number(v));
+            if (p.claimed !== 'true') {
+              if (p.claimed !== 'false' && process.env.PREPARE_RESULT === 'success') throw Error();
+              for (const k of ['item_key','lease_id','lease_revision','claim_generation','protocol_version']) if (p[k]) throw Error();
+              out({claimed:'false'}); process.exit(0);
+            }
+            if (p.protocol_version !== '2' || !positive(p.lease_revision) || !positive(p.claim_generation) || !p.lease_id) throw Error();
+            const raw = JSON.parse(p.decision);
+            const d = JSON.parse(p.effective_decision || (process.env.PREPARE_RESULT !== 'success' ? p.decision : 'null'));
+            if (!raw || !d || Array.isArray(raw) || Array.isArray(d)) throw Error();
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw.targetRepo) || !Number.isSafeInteger(raw.itemNumber) || raw.itemNumber < 1 ||
+                !['issue','pull_request'].includes(raw.itemKind) || !['issues','pull_request'].includes(raw.sourceEvent) ||
+                raw.sourceAction !== 'manual_explicit_review' || raw.publicationPolicy !== 'record_comment_only' || raw.supersedesInProgress !== false ||
+                p.item_key !== raw.targetRepo+'#'+raw.itemNumber) throw Error();
+            if (raw.sourceHeadSha && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(raw.sourceHeadSha)) throw Error();
+            if (!scalar(d.targetBranch) || !d.targetBranch || !isDeepStrictEqual({...raw,targetBranch:d.targetBranch},d)) throw Error();
+            const status = p.reservation_status || '';
+            if (!['','posted','held','superseded'].includes(status)) throw Error();
+            if (status === 'posted' && (!/^[A-Za-z0-9._-]{1,200}$/.test(p.reservation_owner) || !positive(p.reservation_comment_id) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(p.reservation_head_sha))) throw Error();
+            const retryKind = p.retry_kind || '', retryAt = p.retry_at || '';
+            if (Boolean(retryKind) !== Boolean(retryAt) || (retryKind && (!['coordination','throttle'].includes(retryKind) || !Number.isFinite(Date.parse(retryAt))))) throw Error();
+            const [owner,name] = d.targetRepo.split('/');
+            out({claimed:'true',protocol_version:'2',item_key:p.item_key,lease_id:p.lease_id,lease_revision:p.lease_revision,claim_generation:p.claim_generation,
+              raw_decision:JSON.stringify(raw),decision:JSON.stringify(d),reservation_status:status,reservation_owner:p.reservation_owner||'',reservation_comment_id:p.reservation_comment_id||'',reservation_head_sha:p.reservation_head_sha||'',
+              retry_kind:retryKind,retry_at:retryAt,target_repo:d.targetRepo,target_branch:d.targetBranch,item_number:String(d.itemNumber),item_kind:d.itemKind,target_repo_owner:owner,target_repo_name:name});
+          } catch { console.error('Invalid trusted preparation context'); process.exit(1); }
+          NODE
+
+      - id: fetch-finalize-helper
+        if: ${{ steps.finalize-preparation-context.outputs.claimed == 'true' }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+
+      - id: fence-finalize-authority
+        if: ${{ steps.finalize-preparation-context.outputs.claimed == 'true' }}
+        env:
+          PREPARATION_CONTEXT: "${{ toJSON(steps.finalize-preparation-context.outputs) }}"
+          QUEUE_URL: "${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}"
+          RUN_ATTEMPT: "${{ github.run_attempt }}"
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          printf 'authorized=false\nreason=\n' >> "$GITHUB_OUTPUT"
+          payload="$(node <<'NODE'
+          const p = JSON.parse(process.env.PREPARATION_CONTEXT);
+          const d = JSON.parse(p.raw_decision);
+          const attempt = Number(process.env.RUN_ATTEMPT);
+          if (!Number.isSafeInteger(attempt) || attempt < 1) process.exit(1);
+          process.stdout.write(JSON.stringify({lease_id:p.lease_id,item_key:p.item_key,lease_revision:Number(p.lease_revision),claim_generation:Number(p.claim_generation),run_id:process.env.GITHUB_RUN_ID,run_attempt:attempt,phase:'finalizing',...(d.sourceHeadSha ? {source_head_sha:d.sourceHeadSha} : {})}));
+          NODE
+          )"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "$QUEUE_URL/internal/exact-review/heartbeat")"
+          HTTP_CODE="$http_code" RESPONSE_FILE="$response_file" node <<'NODE'
+          const fs = require('node:fs');
+          const r = JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE,'utf8'));
+          if (process.env.HTTP_CODE === '200' && r.ok === true) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,'authorized=true\nreason=\n');
+          } else if (process.env.HTTP_CODE === '409' && ['lease_not_active','lease_superseded'].includes(r.error)) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,'authorized=false\nreason='+r.error+'\n');
+          } else { console.error('Unconfirmed finalizing authority'); process.exit(1); }
+          NODE
+
+      - id: claim-finalize-authority
+        if: ${{ steps.fence-finalize-authority.outputs.authorized == 'true' }}
+        env:
+          ITEM_KEY: "${{ steps.finalize-preparation-context.outputs.item_key }}"
+          QUEUE_LEASE_ID: "${{ steps.finalize-preparation-context.outputs.lease_id }}"
+          QUEUE_LEASE_REVISION: "${{ steps.finalize-preparation-context.outputs.lease_revision }}"
+          QUEUE_URL: "${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}"
+          RUN_ATTEMPT: "${{ github.run_attempt }}"
+          PREPARATION_CONTEXT: "${{ toJSON(steps.finalize-preparation-context.outputs) }}"
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          test -n "$QUEUE_LEASE_ID"
+          printf 'claimed=false\ndecision={}\n' >> "$GITHUB_OUTPUT"
+          payload="$(node -e '
+            const revision = Number(process.env.QUEUE_LEASE_REVISION);
+            const attempt = Number(process.env.RUN_ATTEMPT);
+            if (!process.env.ITEM_KEY || !Number.isInteger(revision) || revision < 1 || !Number.isInteger(attempt) || attempt < 1) process.exit(1);
+            process.stdout.write(JSON.stringify({ lease_id: process.env.QUEUE_LEASE_ID, item_key: process.env.ITEM_KEY, lease_revision: revision, run_id: process.env.GITHUB_RUN_ID, run_attempt: attempt }));
+          ')"
+          response_file="$(mktemp)"; trap 'rm -f "$response_file"' EXIT
+          status="$(control_plane_curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "${QUEUE_URL%/}/internal/exact-review/claim")"
+          response="$(<"$response_file")"
+          test "$status" = 200
+          RESPONSE="$response" node <<'NODE'
+          const fs = require("node:fs");
+          const value = JSON.parse(process.env.RESPONSE || "{}");
+          const requestedKey = process.env.ITEM_KEY;
+          const requestedRevision = Number(process.env.QUEUE_LEASE_REVISION);
+          const decision = value.decision;
+          const targetRepo = String(decision?.targetRepo || "");
+          const itemNumber = Number(decision?.itemNumber);
+          const canonicalItemKey = `${targetRepo}#${itemNumber}`;
+          if (
+            value.protocol_version !== 2 ||
+            value.claimed !== true ||
+            value.item_key !== requestedKey ||
+            value.lease_revision !== requestedRevision ||
+            !Number.isInteger(value.claim_generation) ||
+            value.claim_generation < 1 ||
+            typeof value.repeat_revision !== "boolean" ||
+            !decision ||
+            typeof decision !== "object" ||
+            !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
+            !Number.isInteger(itemNumber) ||
+            itemNumber < 1 ||
+            (decision.itemKind !== "issue" && decision.itemKind !== "pull_request") ||
+            (decision.sourceEvent !== "issues" && decision.sourceEvent !== "pull_request") ||
+            typeof decision.sourceAction !== "string" ||
+            !decision.sourceAction ||
+            canonicalItemKey !== requestedKey ||
+            value.item_key !== canonicalItemKey
+          ) process.exit(1);
+          if (decision.sourceAction !== "manual_explicit_review" || decision.publicationPolicy !== "record_comment_only") process.exit(1);
+          const prepared = JSON.parse(process.env.PREPARATION_CONTEXT);
+          const { isDeepStrictEqual } = require("node:util");
+          if (value.claim_generation !== Number(prepared.claim_generation) ||
+              !isDeepStrictEqual(value.decision, JSON.parse(prepared.raw_decision)) ||
+              prepared.lease_id !== process.env.QUEUE_LEASE_ID ||
+              prepared.protocol_version !== String(value.protocol_version) ||
+              prepared.item_key !== value.item_key ||
+              Number(prepared.lease_revision) !== value.lease_revision) process.exit(1);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, ["claimed=true", `lease_id=${process.env.QUEUE_LEASE_ID}`, `item_key=${value.item_key}`, `lease_revision=${value.lease_revision}`, `claim_generation=${value.claim_generation}`, `repeat_revision=${value.repeat_revision}`, "protocol_version=2", `decision=${JSON.stringify(decision)}`].join("\n") + "\n");
+          NODE
+
+      - id: source-checkout
+        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          ref: "${{ github.sha }}"
+          persist-credentials: false
+
+      - id: setup-pnpm
+        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' }}
+        uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: "build:node"
+
+      - id: fresh-finalize-live
+        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' }}
+        env:
+          CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.decision }}"
+          RAW_CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.raw_decision }}"
+          TARGET_REPO: "${{ steps.finalize-preparation-context.outputs.target_repo }}"
+          ITEM_NUMBER: "${{ steps.finalize-preparation-context.outputs.item_number }}"
+          CLAIM_TARGET_BRANCH: "${{ steps.finalize-preparation-context.outputs.target_branch }}"
+          RESERVATION_HEAD_SHA: "${{ steps.finalize-preparation-context.outputs.reservation_head_sha }}"
+          GH_TOKEN: "${{ secrets.CLAWSWEEPER_TARGET_READ_TOKEN }}"
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { spawnSync } from 'node:child_process';
+          const e = process.env;
+          const d = JSON.parse(e.CLAIM_DECISION), raw = JSON.parse(e.RAW_CLAIM_DECISION);
+          const repo = e.TARGET_REPO, number = Number(e.ITEM_NUMBER);
+          const out = {proceed:'false',terminal_noop:'false',terminal_missing:'false',guarded_open:'false',admission_retry:'false',retry_kind:'',retry_at:'',decision:JSON.stringify(d),target_branch:e.CLAIM_TARGET_BRANCH,head_sha:'',terminal_disposition:''};
+          const emit = () => fs.appendFileSync(e.GITHUB_OUTPUT,Object.entries(out).map(([k,v])=>k+'='+v+'\n').join(''));
+          function get(route) {
+            const r = spawnSync('gh',['api','--method','GET',route],{encoding:'utf8',timeout:30000,maxBuffer:8*1024*1024});
+            if(r.error || r.status !== 0) {
+              const error = Error('GitHub fresh read failed');
+              error.throttle = /HTTP 429|rate limit exceeded|secondary rate limit/i.test(r.stderr || '');
+              error.missing = /HTTP 404/.test(r.stderr || '');
+              throw error;
+            }
+            return JSON.parse(r.stdout);
+          }
+          function checkedRepo() {
+            const r = get('repos/'+repo);
+            if(r.full_name !== repo || r.private !== false || r.visibility !== 'public' || typeof r.default_branch !== 'string' || !r.default_branch) throw Error('Unverified repository');
+            return r;
+          }
+          function retry(kind,seconds) {
+            out.admission_retry='true'; out.retry_kind=kind; out.retry_at=new Date(Date.now()+seconds*1000).toISOString(); emit();
+          }
+          function terminal(kind) {
+            if(d.commandStatusMarker || d.statusCommentId) throw Error('Command terminal path is not admitted');
+            out.terminal_noop='true'; out.terminal_missing=String(kind==='target_missing'); out.guarded_open=String(kind==='guarded_open'); out.terminal_disposition=kind; emit();
+          }
+          try {
+            if(!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1 || d.targetRepo!==repo || d.itemNumber!==number || d.targetBranch!==e.CLAIM_TARGET_BRANCH) throw Error('Invalid fresh context');
+            if(raw.targetBranch !== d.targetBranch && checkedRepo().default_branch !== d.targetBranch) {
+              retry('coordination',60); process.exit(0);
+            }
+            let item;
+            try { item=get('repos/'+repo+'/issues/'+number); } catch(error) {
+              if(!error.missing) throw error;
+              checkedRepo(); terminal('target_missing'); process.exit(0);
+            }
+            if(item.number!==number || !['open','closed'].includes(item.state) || typeof item.locked!=='boolean') throw Error('Invalid live item');
+            if(item.state==='closed') {terminal('target_closed'); process.exit(0);}
+            if(item.locked) {terminal('guarded_open'); process.exit(0);}
+            if(d.itemKind==='pull_request') {
+              const pr=get('repos/'+repo+'/pulls/'+number);
+              if(pr.number!==number || pr.state!=='open' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(pr.head?.sha || '')) throw Error('Unverified PR head');
+              out.head_sha=pr.head.sha;
+              if((e.RESERVATION_HEAD_SHA && pr.head.sha!==e.RESERVATION_HEAD_SHA) || (raw.sourceHeadSha && pr.head.sha!==raw.sourceHeadSha)) {
+                retry('coordination',60); process.exit(0);
+              }
+            }
+            out.proceed='true'; emit();
+          } catch(error) {
+            if(error.throttle) {retry('throttle',1200);} else {console.error('Fresh target authority could not be verified'); process.exit(1);}
+          }
+          NODE
+
+      - id: download-finalize-bundle
+        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' && steps.finalize-preparation-context.outputs.reservation_status == 'posted' && needs.event-review-apply.result == 'success' && steps.fresh-finalize-live.outcome == 'success' && steps.fresh-finalize-live.outputs.proceed == 'true' && steps.fresh-finalize-live.outputs.admission_retry != 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: "exact-review-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: ".artifacts/exact-review-bundle"
+          run-id: "${{ github.run_id }}"
+          repository: "${{ github.repository }}"
+          github-token: "${{ github.token }}"
+
+      - id: validate-finalize-bundle
+        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' && steps.finalize-preparation-context.outputs.reservation_status == 'posted' && needs.event-review-apply.result == 'success' && steps.fresh-finalize-live.outcome == 'success' && steps.fresh-finalize-live.outputs.proceed == 'true' && steps.fresh-finalize-live.outputs.admission_retry != 'true' && steps.download-finalize-bundle.outcome == 'success' }}
+        env:
+          EXACT_REVIEW_BUNDLE_DIR: ".artifacts/exact-review-bundle"
+          EXACT_REVIEW_PRODUCER_JOB: "event-review-apply"
+          EXACT_REVIEW_PRODUCER_RUN_ID: "${{ github.run_id }}"
+          EXACT_REVIEW_GENERATION_ATTEMPT: "${{ github.run_attempt }}"
+          EXACT_REVIEW_SOURCE_SHA: "${{ github.sha }}"
+          EXACT_REVIEW_CLAIM_GENERATION: "${{ steps.finalize-preparation-context.outputs.claim_generation }}"
+          EXACT_REVIEW_DECISION: "${{ steps.finalize-preparation-context.outputs.decision }}"
+          EXACT_REVIEW_ITEM_KEY: "${{ steps.finalize-preparation-context.outputs.item_key }}"
+          EXACT_REVIEW_ITEM_KIND: "${{ steps.finalize-preparation-context.outputs.item_kind }}"
+          EXACT_REVIEW_ITEM_NUMBER: "${{ steps.finalize-preparation-context.outputs.item_number }}"
+          EXACT_REVIEW_LEASE_REVISION: "${{ steps.finalize-preparation-context.outputs.lease_revision }}"
+          EXACT_REVIEW_PROTOCOL_VERSION: "${{ steps.finalize-preparation-context.outputs.protocol_version }}"
+          EXACT_REVIEW_TARGET_BRANCH: "${{ steps.finalize-preparation-context.outputs.target_branch }}"
+          EXACT_REVIEW_TARGET_REPO: "${{ steps.finalize-preparation-context.outputs.target_repo }}"
+          EXACT_REVIEW_LIVE_GUARDED_OPEN: "${{ steps.fresh-finalize-live.outputs.guarded_open }}"
+          EXACT_REVIEW_LIVE_PROCEEDED: "${{ steps.fresh-finalize-live.outputs.proceed }}"
+          EXACT_REVIEW_LIVE_TERMINAL_MISSING: "${{ steps.fresh-finalize-live.outputs.terminal_missing }}"
+          EXACT_REVIEW_LIVE_TERMINAL_NOOP: "${{ steps.fresh-finalize-live.outputs.terminal_noop }}"
+        run: |
+          pnpm run --silent repair:exact-review-bundle validate
+
+      - id: fence-finalize-handoff
+        if: ${{ always() && steps.fence-finalize-authority.outputs.authorized == 'true' && steps.claim-finalize-authority.outputs.claimed == 'true' }}
+        env:
+          PREPARATION_CONTEXT: "${{ toJSON(steps.finalize-preparation-context.outputs) }}"
+          QUEUE_URL: "${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}"
+          RUN_ATTEMPT: "${{ github.run_attempt }}"
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          printf 'authorized=false\nreason=\n' >> "$GITHUB_OUTPUT"
+          payload="$(node <<'NODE'
+          const p = JSON.parse(process.env.PREPARATION_CONTEXT);
+          const d = JSON.parse(p.raw_decision);
+          const attempt = Number(process.env.RUN_ATTEMPT);
+          if (!Number.isSafeInteger(attempt) || attempt < 1) process.exit(1);
+          process.stdout.write(JSON.stringify({lease_id:p.lease_id,item_key:p.item_key,lease_revision:Number(p.lease_revision),claim_generation:Number(p.claim_generation),run_id:process.env.GITHUB_RUN_ID,run_attempt:attempt,phase:'finalizing',...(d.sourceHeadSha ? {source_head_sha:d.sourceHeadSha} : {})}));
+          NODE
+          )"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "$QUEUE_URL/internal/exact-review/heartbeat")"
+          HTTP_CODE="$http_code" RESPONSE_FILE="$response_file" node <<'NODE'
+          const fs = require('node:fs');
+          const r = JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE,'utf8'));
+          if (process.env.HTTP_CODE === '200' && r.ok === true) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,'authorized=true\nreason=\n');
+          } else if (process.env.HTTP_CODE === '409' && ['lease_not_active','lease_superseded'].includes(r.error)) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,'authorized=false\nreason='+r.error+'\n');
+          } else { console.error('Unconfirmed finalizing authority'); process.exit(1); }
+          NODE
+
+      - id: queue-exact-review-publication
+        if: ${{ steps.fence-finalize-handoff.outputs.authorized == 'true' && steps.validate-finalize-bundle.outcome == 'success' && steps.fresh-finalize-live.outcome == 'success' && steps.fresh-finalize-live.outputs.proceed == 'true' && steps.fresh-finalize-live.outputs.admission_retry != 'true' }}
+        env:
+          ARTIFACT_NAME: "exact-review-${{ github.run_id }}-${{ github.run_attempt }}"
+          CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.decision }}"
+          CLAIM_GENERATION: "${{ steps.finalize-preparation-context.outputs.claim_generation }}"
+          ITEM_KEY: "${{ steps.finalize-preparation-context.outputs.item_key }}"
+          LEASE_REVISION: "${{ steps.finalize-preparation-context.outputs.lease_revision }}"
+          LIVE_GUARDED_OPEN: "${{ steps.fresh-finalize-live.outputs.guarded_open }}"
+          LIVE_PROCEEDED: "${{ steps.fresh-finalize-live.outputs.proceed }}"
+          LIVE_TERMINAL_MISSING: "${{ steps.fresh-finalize-live.outputs.terminal_missing }}"
+          LIVE_TERMINAL_NOOP: "${{ steps.fresh-finalize-live.outputs.terminal_noop }}"
+          PROTOCOL_VERSION: "${{ steps.finalize-preparation-context.outputs.protocol_version }}"
+          QUEUE_URL: "${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}"
+          CLAWSWEEPER_WEBHOOK_SECRET: "${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}"
+        run: |
+          set -euo pipefail
+          source scripts/control-plane-curl.sh
+          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
+          queue_url="${QUEUE_URL%/}"
+          payload="$(node <<'NODE'
+          const producerDecision = JSON.parse(process.env.CLAIM_DECISION || "{}");
+          const producerRunAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+          const protocolVersion = Number(process.env.PROTOCOL_VERSION);
+          const leaseRevision = process.env.LEASE_REVISION ? Number(process.env.LEASE_REVISION) : null;
+          const claimGeneration = process.env.CLAIM_GENERATION ? Number(process.env.CLAIM_GENERATION) : null;
+          const flag = (name) => {
+            const value = process.env[name];
+            if (value === "true") return true;
+            if (value === "false") return false;
+            process.exit(1);
+          };
+          if (!Number.isInteger(producerRunAttempt) || producerRunAttempt < 1) process.exit(1);
+          process.stdout.write(JSON.stringify({
+            delivery_id: `publisher:${process.env.GITHUB_RUN_ID}:${producerRunAttempt}`,
+            decision: {
+              ...producerDecision,
+              sourceAction: "exact_review_artifact_publish",
+              supersedesInProgress: false,
+              publication: {
+                artifactName: process.env.ARTIFACT_NAME,
+                producerRunId: process.env.GITHUB_RUN_ID,
+                producerRunAttempt,
+                sourceSha: process.env.GITHUB_SHA,
+                itemKey: process.env.ITEM_KEY,
+                protocolVersion,
+                leaseRevision,
+                claimGeneration,
+                liveProceeded: flag("LIVE_PROCEEDED"),
+                liveTerminalNoop: flag("LIVE_TERMINAL_NOOP"),
+                liveTerminalMissing: flag("LIVE_TERMINAL_MISSING"),
+                liveGuardedOpen: flag("LIVE_GUARDED_OPEN"),
+                producerDecision,
+              },
+            },
+          }));
+          NODE
+          )"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          response="$(
+            control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $signature" \
+              --data "$payload" \
+              "$queue_url/internal/exact-review/enqueue" || true
+          )"
+          if jq -e '.superseded == true' <<< "$response" >/dev/null 2>&1; then
+            echo "::notice::Exact-review publication revision $(jq -r '.publication_revision // "unknown"' <<< "$response") was superseded by revision $(jq -r '.superseded_by_revision // "unknown"' <<< "$response"); the newer publisher owns final delivery."
+            exit 0
+          fi
+          if jq -e '.ok == true and (.queued == true or .deduped == true)' <<< "$response" >/dev/null; then
+            exit 0
+          fi
+          exit 1
+
+      - id: record-finalize-terminal
+        if: ${{ always() && steps.fence-finalize-handoff.outputs.authorized == 'true' && steps.fresh-finalize-live.outcome == 'success' && steps.fresh-finalize-live.outputs.terminal_disposition != '' }}
+        env:
+          TARGET_REPO: "${{ steps.finalize-preparation-context.outputs.target_repo }}"
+          ITEM_NUMBER: "${{ steps.finalize-preparation-context.outputs.item_number }}"
+          FENCE_KEY: "${{ steps.finalize-preparation-context.outputs.item_key }}"
+          REVISION: "${{ steps.finalize-preparation-context.outputs.lease_revision }}"
+          LIFECYCLE_TERMINAL: "${{ steps.fresh-finalize-live.outputs.terminal_disposition }}"
+          CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.decision }}"
+          QUEUE_URL: "${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}"
+          CLAWSWEEPER_WEBHOOK_SECRET: "${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}"
+        run: |
+          set -euo pipefail
+          source scripts/control-plane-curl.sh
+          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
+          payload="$(node <<'NODE'
+          const d=JSON.parse(process.env.CLAIM_DECISION);
+          const revision=Number(process.env.REVISION), kind=process.env.LIFECYCLE_TERMINAL;
+          if(d.commandStatusMarker || d.statusCommentId || !Number.isSafeInteger(revision) || revision<1 || !['target_closed','target_missing','guarded_open','policy_noop'].includes(kind)) process.exit(1);
+          process.stdout.write(JSON.stringify({canonical_target_key:process.env.TARGET_REPO+'#'+process.env.ITEM_NUMBER,fence_key:process.env.FENCE_KEY,revision,kind}));
+          NODE
+          )"
+          signature="$(PAYLOAD="$payload" node -e 'process.stdout.write("sha256="+require("node:crypto").createHmac("sha256",process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex"))')"
+          response="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 --request POST --header 'content-type: application/json' --header "x-clawsweeper-exact-review-signature: $signature" --data "$payload" "$QUEUE_URL/internal/exact-review/lifecycle/terminal-disposition")"
+          RESPONSE="$response" node <<'NODE'
+          const r=JSON.parse(process.env.RESPONSE);
+          if(r.ok!==true || r.lifecycle_state!==process.env.LIFECYCLE_TERMINAL) process.exit(1);
+          require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT,'recorded=true\nterminal_disposition='+r.lifecycle_state+'\n');
+          NODE
+
+      - id: exact-review-generation-result
+        if: ${{ always() }}
+        env:
+          PREPARE_RESULT: "${{ needs.event-review-prepare.result }}"
+          MODEL_RESULT: "${{ needs.event-review-apply.result }}"
+          CLAIMED: "${{ steps.finalize-preparation-context.outputs.claimed }}"
+          RESERVATION_STATUS: "${{ steps.finalize-preparation-context.outputs.reservation_status }}"
+          RETRY_KIND: "${{ steps.fresh-finalize-live.outputs.retry_kind || steps.finalize-preparation-context.outputs.retry_kind }}"
+          RETRY_AT: "${{ steps.fresh-finalize-live.outputs.retry_at || steps.finalize-preparation-context.outputs.retry_at }}"
+          TERMINAL_RECORDED: "${{ steps.record-finalize-terminal.outputs.recorded }}"
+          TERMINAL_DISPOSITION: "${{ steps.record-finalize-terminal.outputs.terminal_disposition }}"
+          FIRST_FENCE_AUTHORIZED: "${{ steps.fence-finalize-authority.outputs.authorized }}"
+          HANDOFF_FENCE_AUTHORIZED: "${{ steps.fence-finalize-handoff.outputs.authorized }}"
+          LIVE_OUTCOME: "${{ steps.fresh-finalize-live.outcome }}"
+          VALIDATE_OUTCOME: "${{ steps.validate-finalize-bundle.outcome }}"
+          PUBLICATION_QUEUE_OUTCOME: "${{ steps.queue-exact-review-publication.outcome }}"
+          TERMINAL_OUTCOME: "${{ steps.record-finalize-terminal.outcome }}"
+          CONTEXT_OUTCOME: "${{ steps.finalize-preparation-context.outcome }}"
+          FIRST_FENCE_OUTCOME: "${{ steps.fence-finalize-authority.outcome }}"
+          HANDOFF_FENCE_OUTCOME: "${{ steps.fence-finalize-handoff.outcome }}"
+          CLAIM_OUTCOME: "${{ steps.claim-finalize-authority.outcome }}"
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs=require('node:fs'), e=process.env;
+          const r={outcome:'failure',requeue_latest:'false',retry_kind:'',retry_at:'',lifecycle_terminal_disposition:'',cleanup_mode:'none',failed:'false',completion_required:'false'};
+          const platformFailed=[e.PREPARE_RESULT,e.MODEL_RESULT].some(v=>v==='failure'||v==='cancelled');
+          const emit=()=>fs.appendFileSync(e.GITHUB_OUTPUT,Object.entries(r).map(([k,v])=>k+'='+v+'\n').join(''));
+          const cancelled=[e.PREPARE_RESULT,e.MODEL_RESULT].includes('cancelled');
+          const fail=()=>{r.failed='true';r.outcome=cancelled?'cancelled':'failure';};
+          if(e.CONTEXT_OUTCOME!=='success') {fail();emit();process.exit(0);}
+          if(e.CLAIMED!=='true') {
+            if(platformFailed) fail(); else r.outcome='success';
+            emit();process.exit(0);
+          }
+          const earlierFailure=platformFailed || [e.VALIDATE_OUTCOME,e.LIVE_OUTCOME].includes('failure');
+          if(e.FIRST_FENCE_AUTHORIZED!=='true' || e.CLAIM_OUTCOME!=='success' || e.HANDOFF_FENCE_AUTHORIZED!=='true') {
+            const knownFirst=e.FIRST_FENCE_OUTCOME==='success' && e.FIRST_FENCE_AUTHORIZED==='false';
+            const knownLast=e.FIRST_FENCE_AUTHORIZED==='true' && e.CLAIM_OUTCOME==='success' && e.HANDOFF_FENCE_OUTCOME==='success' && e.HANDOFF_FENCE_AUTHORIZED==='false';
+            if((knownFirst || knownLast) && !earlierFailure) r.outcome='success'; else fail();
+            emit();process.exit(0);
+          }
+          r.completion_required='true';
+          const terminal=e.TERMINAL_OUTCOME==='success' && e.TERMINAL_RECORDED==='true' && ['target_closed','target_missing','guarded_open','policy_noop'].includes(e.TERMINAL_DISPOSITION);
+          if(e.PUBLICATION_QUEUE_OUTCOME==='success' || terminal) {
+            r.outcome='success';
+            if(terminal) r.lifecycle_terminal_disposition=e.TERMINAL_DISPOSITION;
+            if(e.RESERVATION_STATUS==='posted') r.cleanup_mode='expire';
+          } else {
+            if(e.RESERVATION_STATUS==='posted') r.cleanup_mode='delete';
+            const kind=e.RETRY_KIND || '', at=e.RETRY_AT || '';
+            const validRetry=['coordination','throttle'].includes(kind) && Number.isFinite(Date.parse(at));
+            const malformed=Boolean(kind || at) && !validRetry;
+            if(validRetry && !platformFailed) {
+              r.retry_kind=kind;r.retry_at=at;
+            } else if(e.VALIDATE_OUTCOME==='failure' || e.TERMINAL_OUTCOME==='failure' || e.LIVE_OUTCOME==='failure' || malformed ||
+                      (!platformFailed && e.PUBLICATION_QUEUE_OUTCOME!=='failure')) {
+              r.retry_kind='coordination';r.retry_at=new Date(Date.now()+60000).toISOString();
+            }
+            if(platformFailed || earlierFailure || malformed || e.PUBLICATION_QUEUE_OUTCOME==='failure' || e.TERMINAL_OUTCOME==='failure') fail();
+          }
+          emit();
+          NODE
+
+      - id: finalize-cleanup-token
+        if: ${{ always() && steps.fence-finalize-handoff.outputs.authorized == 'true' && steps.finalize-preparation-context.outputs.reservation_status == 'posted' && steps.exact-review-generation-result.outputs.cleanup_mode != 'none' && steps.setup-pnpm.outcome == 'success' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: "${{ env.CLAWSWEEPER_APP_CLIENT_ID }}"
+          private-key: "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}"
+          owner: "${{ steps.finalize-preparation-context.outputs.target_repo_owner }}"
+          repositories: "${{ steps.finalize-preparation-context.outputs.target_repo_name }}"
+          permission-issues: "write"
+
+      - id: finalize-owner-cleanup
+        if: ${{ always() && steps.fence-finalize-handoff.outputs.authorized == 'true' && steps.finalize-preparation-context.outputs.reservation_status == 'posted' && steps.exact-review-generation-result.outputs.cleanup_mode != 'none' && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          TARGET_REPO: "${{ steps.finalize-preparation-context.outputs.target_repo }}"
+          ITEM_NUMBER: "${{ steps.finalize-preparation-context.outputs.item_number }}"
+          RESERVATION_STATUS: "${{ steps.finalize-preparation-context.outputs.reservation_status }}"
+          RESERVATION_OWNER: "${{ steps.finalize-preparation-context.outputs.reservation_owner }}"
+          RESERVATION_COMMENT_ID: "${{ steps.finalize-preparation-context.outputs.reservation_comment_id }}"
+          RESERVATION_HEAD_SHA: "${{ steps.finalize-preparation-context.outputs.reservation_head_sha }}"
+          CLEANUP_MODE: "${{ steps.exact-review-generation-result.outputs.cleanup_mode }}"
+          GH_TOKEN: "${{ steps.finalize-cleanup-token.outputs.token }}"
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { spawnSync } from 'node:child_process';
+          import { isTrustedReviewStartStatusComment } from './dist/repair/comment-router-core.js';
+          import { trailingHtmlComments } from './dist/review-comment-markers.js';
+          import { expireReviewStartStatusLease } from './dist/clawsweeper-review-comment-state.js';
+          const e=process.env;
+          const emit=(status)=>fs.appendFileSync(e.GITHUB_OUTPUT,'status='+status+'\n');
+          try {
+            if(e.CLEANUP_MODE==='none' || e.RESERVATION_STATUS!=='posted') {emit('skipped'); process.exit(0);}
+            const repo=e.TARGET_REPO, number=Number(e.ITEM_NUMBER), id=Number(e.RESERVATION_COMMENT_ID);
+            if(!['expire','delete'].includes(e.CLEANUP_MODE) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1 || !Number.isSafeInteger(id) || id<1 ||
+               !/^[A-Za-z0-9._-]{1,200}$/.test(e.RESERVATION_OWNER) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(e.RESERVATION_HEAD_SHA)) throw Error();
+            const run=(args,input)=> {
+              const r=spawnSync('gh',['api',...args],{encoding:'utf8',input,timeout:30000,maxBuffer:16*1024*1024});
+              if(r.error || r.status!==0) throw Error('GitHub comment transport failed');
+              return r.stdout;
+            };
+            const pages=JSON.parse(run(['--method','GET','repos/'+repo+'/issues/'+number+'/comments?per_page=100','--paginate','--slurp']));
+            if(!Array.isArray(pages) || !pages.every(Array.isArray)) throw Error('Incomplete comments');
+            const matches=pages.flat().filter(c=>c.id===id);
+            if(matches.length===0) {emit('already_absent'); process.exit(0);}
+            if(matches.length!==1) throw Error('Duplicate comment identity');
+            const comment=matches[0];
+            const trustedAuthors=new Set(['clawsweeper','clawsweeper[bot]','openclaw-clawsweeper[bot]']);
+            if(!isTrustedReviewStartStatusComment({comment,trustedAuthors})) throw Error('Untrusted marker');
+            const markers=trailingHtmlComments(comment.body);
+            if(markers.at(-1)!=='<!-- clawsweeper-review-lease item='+number+' -->') throw Error('Not dedicated lease');
+            const started=markers.at(-2) || '';
+            if(!/^<!--\s*clawsweeper-review-status:started\b[^>]*-->$/i.test(started)) throw Error();
+            for(const [key,expected] of [['item',String(number)],['owner',e.RESERVATION_OWNER],['sha',e.RESERVATION_HEAD_SHA]]) {
+              const values=[...started.matchAll(new RegExp('\\b'+key+'=([^\\s>]+)','g'))].map(m=>m[1]);
+              if(values.length!==1 || values[0]!==expected) throw Error('Owner/head fence mismatch');
+            }
+            const endpoint='repos/'+repo+'/issues/comments/'+id;
+            if(e.CLEANUP_MODE==='expire') {
+              const body=expireReviewStartStatusLease(comment.body,new Date().toISOString(),number);
+              run(['--method','PATCH',endpoint,'--input','-'],JSON.stringify({body}));
+              emit('expired');
+            } else {run(['--method','DELETE',endpoint]); emit('deleted');}
+          } catch {console.error('Exact reservation cleanup failed'); process.exit(1);}
+          NODE
+
+      - id: complete-exact-review-queue
+        if: ${{ always() && steps.exact-review-generation-result.outputs.completion_required == 'true' }}
+        env:
+          SOURCE_CHECKOUT_OUTCOME: "${{ steps.source-checkout.outcome }}"
+          PRIMARY_OUTCOME: "${{ steps.exact-review-generation-result.outputs.outcome || 'failure' }}"
+          CLAIM_GENERATION: "${{ steps.finalize-preparation-context.outputs.claim_generation }}"
+          ITEM_KEY: "${{ steps.finalize-preparation-context.outputs.item_key }}"
+          PROTOCOL_VERSION: "${{ steps.finalize-preparation-context.outputs.protocol_version }}"
+          QUEUE_LEASE_ID: "${{ steps.finalize-preparation-context.outputs.lease_id }}"
+          QUEUE_LEASE_REVISION: "${{ steps.finalize-preparation-context.outputs.lease_revision }}"
+          QUEUE_URL: "${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}"
+          REQUEUE_LATEST: "${{ steps.exact-review-generation-result.outputs.requeue_latest }}"
+          RETRY_KIND: "${{ steps.exact-review-generation-result.outputs.retry_kind }}"
+          RETRY_AT: "${{ steps.exact-review-generation-result.outputs.retry_at }}"
+          LIFECYCLE_TERMINAL_DISPOSITION: "${{ steps.exact-review-generation-result.outputs.lifecycle_terminal_disposition }}"
+          RUN_ATTEMPT: "${{ github.run_attempt }}"
+        run: |
+          set -euo pipefail
+          if [[ "$SOURCE_CHECKOUT_OUTCOME" == "success" ]]; then
+            source scripts/control-plane-curl.sh
+          else
+            source "$RUNNER_TEMP/control-plane-curl.sh"
+          fi
+          test -n "$QUEUE_LEASE_ID"
+          payload="$(node <<'NODE'
+          const e=process.env, attempt=Number(e.RUN_ATTEMPT), revision=Number(e.QUEUE_LEASE_REVISION), generation=Number(e.CLAIM_GENERATION);
+          if(e.PROTOCOL_VERSION!=='2' || !e.ITEM_KEY || ![attempt,revision,generation].every(v=>Number.isSafeInteger(v)&&v>0)) process.exit(1);
+          const outcome=e.PRIMARY_OUTCOME, kind=e.RETRY_KIND||'', at=e.RETRY_AT||'', terminal=e.LIFECYCLE_TERMINAL_DISPOSITION||'';
+          if(!['success','failure','cancelled'].includes(outcome) || Boolean(kind)!==Boolean(at) ||
+             (kind && (outcome!=='failure' || !['coordination','throttle'].includes(kind) || !Number.isFinite(Date.parse(at)))) ||
+             (terminal && (outcome!=='success' || !['target_closed','target_missing','guarded_open','policy_noop'].includes(terminal)))) process.exit(1);
+          process.stdout.write(JSON.stringify({lease_id:e.QUEUE_LEASE_ID,item_key:e.ITEM_KEY,lease_revision:revision,claim_generation:generation,run_id:e.GITHUB_RUN_ID,run_attempt:attempt,outcome,
+            ...(e.REQUEUE_LATEST==='true'?{requeue_latest:true}:{}),...(kind?{retry_kind:kind,retry_at:at}:{}),...(terminal?{lifecycle_terminal_disposition:terminal}:{})}));
+          NODE
+          )"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          http_code="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "$QUEUE_URL/internal/exact-review/complete")"
+          if [[ "$http_code" == 2* ]]; then exit 0; fi
+          if [ "$http_code" = 409 ] && jq -e '.error == "lease_superseded"' "$response_file" >/dev/null; then exit 0; fi
+          echo 'Producer completion was not confirmed' >&2
+          exit 1
+
+      - id: fail-finalize
+        if: ${{ always() }}
+        env:
+          PRIMARY_FAILED: "${{ steps.exact-review-generation-result.outputs.failed }}"
+          COMPLETION_REQUIRED: "${{ steps.exact-review-generation-result.outputs.completion_required }}"
+          COMPLETE_OUTCOME: "${{ steps.complete-exact-review-queue.outcome }}"
+          CLEANUP_OUTCOME: "${{ steps.finalize-owner-cleanup.outcome }}"
+        run: |
+          set -euo pipefail
+          if [[ "$PRIMARY_FAILED" == "true" || "$CLEANUP_OUTCOME" == "failure" || "$CLEANUP_OUTCOME" == "cancelled" ]]; then exit 1; fi
+          if [[ "$COMPLETION_REQUIRED" == "true" && "$COMPLETE_OUTCOME" != "success" ]]; then exit 1; fi
 
   event-review-publish:
     name: Publish exact review artifact
