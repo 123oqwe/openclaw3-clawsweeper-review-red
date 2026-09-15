@@ -7,7 +7,8 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import YAML from "yaml";
-import { ExactReviewQueue, MemoryDurableStorage, leasedExactReviewQueueItem } from "./dashboard-worker-harness.ts";
+import worker from "../dashboard/worker.ts";
+import { ExactReviewQueue, MemoryDurableNamespace, MemoryDurableStorage, leasedExactReviewQueueItem } from "./dashboard-worker-harness.ts";
 
 // W3-A only: real CLI handoff and lease-loss termination before model generation.
 // A controlled metadata refusal is expected, never counted as successful review.
@@ -76,16 +77,28 @@ async function execute(path: string, scenario: "metadata-denied" | "revoked") {
   const storage = new MemoryDurableStorage();
   await storage.put("exact-review-queue", { deliveries: {}, items: { [itemKey]: leased } });
   const queue = new ExactReviewQueue({ storage }, { hostedTargetPredicate: () => true, hostedPublicTargetProbe: async () => "public", EXACT_REVIEW_MANUAL_PUBLICATION_ENABLED: "1" });
+  const readModelEnv = { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue) };
   const queueTrace: Array<{ body: Record<string, unknown>; status: number }> = [];
+  const readModelTrace: Array<{ body: Record<string, unknown>; status: number; snapshot: Record<string, unknown> }> = [];
   let takeover: Record<string, unknown> | undefined;
   let serverError: unknown;
   const server = createServer(async (req, res) => {
     try {
       assert.equal(req.method, "POST");
-      assert.equal(req.url, "/internal/exact-review/heartbeat");
+      assert.ok(req.url === "/internal/exact-review/heartbeat" || req.url === "/internal/exact-review/github-read-model/item", `unexpected queue route: ${req.url}`);
       let bytes = "";
       for await (const chunk of req) bytes += chunk;
       const body = JSON.parse(bytes);
+      // The real CLI synchronously reads this lease-scoped cache before gh.
+      // Dispatch before the heartbeat barrier; waiting for metadata here deadlocks.
+      if (req.url === "/internal/exact-review/github-read-model/item") {
+        const response = await worker.fetch(new Request(`https://clawsweeper.openclaw.ai${req.url}`, { method: "POST", headers: { "content-type": "application/json" }, body: bytes }), readModelEnv);
+        const responseText = await response.text();
+        readModelTrace.push({ body, status: response.status, snapshot: JSON.parse(responseText) });
+        res.writeHead(response.status, { "content-type": "application/json" });
+        res.end(responseText);
+        return;
+      }
       if (scenario === "revoked" && !takeover) {
         const deadline = Date.now() + 8_000;
         while (!readEvents(ghTrace).some((entry) => entry.event === "metadata-ready") && Date.now() < deadline) await delay(10);
@@ -183,6 +196,11 @@ async function execute(path: string, scenario: "metadata-denied" | "revoked") {
     }
     assert.equal(github.some((entry) => entry.event === "unexpected-gh" || entry.event === "barrier-timeout"), false, JSON.stringify(github));
     assert.equal(readEvents(modelTrace).length, 0, "metadata-stage fixture must not launch a provider");
+    assert.equal(readModelTrace.length, 1, "real CLI must perform its lease-scoped read-model lookup before gh fallback");
+    assert.deepEqual(readModelTrace[0].body, { repository: targetRepo, number: 41, item_key: itemKey, lease_id: leased.leaseId, lease_revision: 1, claim_generation: 1, run_id: runId, run_attempt: 1, source_head_sha: head });
+    assert.equal(readModelTrace[0].status, 200);
+    for (const [name, value] of Object.entries({ ok: true, lease_authorized: true, hit: false, usable: false })) assert.equal(readModelTrace[0].snapshot[name], value, `real empty read-model ${name}`);
+    assert.equal(Object.hasOwn(readModelTrace[0].snapshot, "item"), false);
     assert.ok(queueTrace.length >= 1, "actual executor must heartbeat its real queue lease");
     for (const entry of queueTrace) assert.deepEqual(entry.body, { item_key: itemKey, lease_id: leased.leaseId, lease_revision: 1, claim_generation: 1, run_id: runId, run_attempt: 1, source_head_sha: head });
     const result = readFileSync(output, "utf8");
