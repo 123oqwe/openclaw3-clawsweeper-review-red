@@ -136,6 +136,7 @@ async function execute(path: string, scenario: "metadata-denied" | "revoked") {
     const values: Record<string, string> = {
       "steps.live-item.outputs.pr_admission_file": "", "steps.live-item.outputs.oversized": "false",
       "steps.target-read-token.outputs.token": "synthetic-read-token",
+      "secrets.CLAWSWEEPER_TARGET_READ_TOKEN": "synthetic-read-token",
       "fromJSON(steps.claim-exact-review-queue.outputs.decision).additionalPrompt || ''": "",
       "vars.CLAWSWEEPER_RELATED_GITHUB_SEARCH || '1'": "0",
       // Unset repository variable: use the fixed upstream's declared fallback.
