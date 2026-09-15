@@ -6,27 +6,88 @@ on:
       target_repository:
         required: true
         type: string
+      registry_ref:
+        required: true
+        type: string
+    outputs:
+      outcome:
+        description: Public registered target result
+        value: ${{ jobs.admission.outputs.outcome }}
+    secrets:
+      CLAWSWEEPER_APP_PRIVATE_KEY:
+        required: true
 
 permissions: {}
 
 jobs:
   admission:
     runs-on: ubuntu-24.04
+    outputs:
+      outcome: ${{ steps.probe.outputs.outcome }}
     steps:
       - name: Load self-owned target registry
+        id: eligibility
         env:
           REGISTRY_REPOSITORY: ${{ github.repository }}
+          REGISTRY_REF: ${{ inputs.registry_ref }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
         run: |
+          set -euo pipefail
           test -n "$REGISTRY_REPOSITORY"
+          test -n "$TARGET_REPOSITORY"
+          if ! printf '%s' "$TARGET_REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo 'outcome=terminal' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! printf '%s' "$REGISTRY_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo 'outcome=terminal' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           curl --fail --silent --show-error \
-            "https://raw.githubusercontent.com/$REGISTRY_REPOSITORY/main/config/target-repositories.json" \
+            "https://raw.githubusercontent.com/$REGISTRY_REPOSITORY/$REGISTRY_REF/config/target-repositories.json" \
             -o target-repositories.json
-          node dist/hosted-target-admission.js --registry target-repositories.json \
-            --target "${{ inputs.target_repository }}"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+          const target = process.env.TARGET_REPOSITORY.toLowerCase();
+          const registry = JSON.parse(fs.readFileSync("target-repositories.json", "utf8"));
+          const registered = Array.isArray(registry.repositories) && registry.repositories.some((entry) => entry?.target_repo?.toLowerCase() === target);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `outcome=${registered ? "eligible" : "terminal"}\n`);
+          NODE
       - name: Mint self-owned admission identity token
+        id: metadata-token
+        if: ${{ steps.eligibility.outputs.outcome == 'eligible' }}
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
+          permission-metadata: read
+      - name: Probe current public visibility
+        id: probe
+        env:
+          TARGET_ELIGIBILITY: ${{ steps.eligibility.outputs.outcome }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          METADATA_TOKEN: ${{ steps.metadata-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+          let outcome = "retryable";
+          if (process.env.TARGET_ELIGIBILITY === "terminal") {
+            outcome = "terminal";
+          } else if (process.env.TARGET_ELIGIBILITY === "eligible" && process.env.METADATA_TOKEN) {
+            try {
+              const response = await fetch(`https://api.github.com/repos/${process.env.TARGET_REPOSITORY}`, {
+                redirect: "manual", signal: AbortSignal.timeout(20_000),
+                headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.METADATA_TOKEN}` },
+              });
+              if (response.status === 404) outcome = "terminal";
+              else if (response.status === 200) {
+                const repository = await response.json();
+                outcome = repository && repository.private === false ? "public" : "terminal";
+              }
+            } catch {}
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `outcome=${outcome}\n`);
+          NODE

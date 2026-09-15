@@ -13,6 +13,11 @@ on:
         description: Explicit registered target repository
         required: true
         type: string
+      target_branch:
+        description: Registered target branch
+        required: false
+        default: main
+        type: string
 
 # The workflow's ambient token is never used to mutate a target.
 permissions:
@@ -23,58 +28,286 @@ env:
   EXACT_REVIEW_QUEUE_URL: ${{ vars.EXACT_REVIEW_QUEUE_URL }}
 
 jobs:
-  manual-selection:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Enqueue explicit review-only selection
-        env:
-          ITEM_NUMBER: ${{ inputs.item_number }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          EXACT_REVIEW_QUEUE_SHARED_SECRET: ${{ secrets.EXACT_REVIEW_QUEUE_SHARED_SECRET }}
-        run: |
-          test -n "$ITEM_NUMBER"
-          test -n "$TARGET_REPO"
-          test -n "$EXACT_REVIEW_QUEUE_SHARED_SECRET"
-          # The Worker accepts only the signed record_comment_only manual schema.
-          node dist/repair/manual-review-enqueue.js \
-            --target-repo "$TARGET_REPO" --item-number "$ITEM_NUMBER" \
-            --queue-url "$EXACT_REVIEW_QUEUE_URL"
+  admit-manual-target:
+    uses: ./.github/workflows/hosted-target-admission.yml
+    with:
+      target_repository: ${{ inputs.target_repo }}
+      registry_ref: ${{ vars.CLAWSWEEPER_REVIEW_REGISTRY_REF }}
+    secrets:
+      CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
-  event-review-apply:
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'manual_explicit_review' && github.event.client_payload.publication_policy == 'record_comment_only' }}
+  manual-selection:
+    needs: admit-manual-target
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.admit-manual-target.outputs.outcome == 'public' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Claim exact-review queue lease
-        env:
-          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
-          EXACT_REVIEW_QUEUE_SHARED_SECRET: ${{ secrets.EXACT_REVIEW_QUEUE_SHARED_SECRET }}
-        run: |
-          test -n "$QUEUE_LEASE_ID"
-          test -n "$EXACT_REVIEW_QUEUE_SHARED_SECRET"
-          # Claim is intentionally before any model credential or model setup.
-          node dist/repair/exact-review-claim.js --lease "$QUEUE_LEASE_ID"
-      - name: Setup review model after a successful claim
-        uses: openai/setup-codex@v1
         with:
-          api-key: ${{ secrets.CODEX_API_KEY }}
-      - name: Produce review artifact only
-        run: node dist/repair/exact-review.js --publication-policy record_comment_only
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+      - name: Enqueue explicit review-only selection
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          ITEM_NUMBER: ${{ inputs.item_number }}
+        run: |
+          set -euo pipefail
+          test -n "$ITEM_NUMBER"
+          test -n "$TARGET_REPO"
+          node dist/repair/manual-review-enqueue.js \
+            --target-repo "$TARGET_REPO" --target-branch "$TARGET_BRANCH" \
+            --item-numbers "$ITEM_NUMBER" --request-id "$GITHUB_RUN_ID" \
+            --codex-timeout-ms 1200000 --queue-url "$QUEUE_URL"
 
-  event-review-publish:
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_action == 'exact_review_artifact_publish' && github.event.client_payload.publication_policy == 'record_comment_only' }}
+  event-review-apply:
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Mint narrowly scoped reviewer identity token
-        id: reviewer-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          permission-issues: write
-      - name: Publish the verified review comment
+      - name: Fetch control-plane retry helper
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+      - name: Claim exact-review queue lease
+        id: claim-exact-review-queue
         env:
-          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
-        run: node dist/repair/exact-review-publish.js --record-comment-only
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key }}
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          QUEUE_LEASE_REVISION: ${{ github.event.client_payload.queue_claim.lease_revision || github.event.client_payload.lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          test -n "$QUEUE_LEASE_ID"
+          printf 'claimed=false\ndecision={}\n' >> "$GITHUB_OUTPUT"
+          payload="$(node -e '
+            const revision = Number(process.env.QUEUE_LEASE_REVISION);
+            const attempt = Number(process.env.RUN_ATTEMPT);
+            if (!process.env.ITEM_KEY || !Number.isInteger(revision) || revision < 1 || !Number.isInteger(attempt) || attempt < 1) process.exit(1);
+            process.stdout.write(JSON.stringify({ lease_id: process.env.QUEUE_LEASE_ID, item_key: process.env.ITEM_KEY, lease_revision: revision, run_id: process.env.GITHUB_RUN_ID, run_attempt: attempt }));
+          ')"
+          response_file="$(mktemp)"; trap 'rm -f "$response_file"' EXIT
+          status="$(control_plane_curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST --header 'content-type: application/json' --data "$payload" "${QUEUE_URL%/}/internal/exact-review/claim")"
+          response="$(<"$response_file")"
+          if [ "$status" = 409 ]; then
+            exit 0
+          fi
+          test "$status" = 200
+          RESPONSE="$response" node <<'NODE'
+          const fs = require("node:fs");
+          const value = JSON.parse(process.env.RESPONSE || "{}");
+          const requestedKey = process.env.ITEM_KEY;
+          const requestedRevision = Number(process.env.QUEUE_LEASE_REVISION);
+          const decision = value.decision;
+          if (value.protocol_version !== 2 || value.claimed !== true || value.item_key !== requestedKey || value.lease_revision !== requestedRevision || !Number.isInteger(value.claim_generation) || value.claim_generation < 1 || typeof value.repeat_revision !== "boolean" || !decision || typeof decision !== "object") process.exit(1);
+          if (decision.sourceAction !== "manual_explicit_review" || decision.publicationPolicy !== "record_comment_only") process.exit(1);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, ["claimed=true", `lease_id=${process.env.QUEUE_LEASE_ID}`, `item_key=${value.item_key}`, `lease_revision=${value.lease_revision}`, `claim_generation=${value.claim_generation}`, `repeat_revision=${value.repeat_revision}`, "protocol_version=2", `decision=${JSON.stringify(decision)}`].join("\n") + "\n");
+          NODE
+      - uses: actions/checkout@v4
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pnpm
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        with:
+          build-script: build:repair
+      - name: Setup review model after a successful claim
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        uses: ./.github/actions/setup-codex
+      - name: Run the existing review executor
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        run: pnpm run review
+
+  event-review-publish:
+    name: Publish exact review artifact
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'exact_review_artifact_publish' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Fetch control-plane retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-all-errors --retry-connrefused "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/control-plane-curl.sh" -o "$RUNNER_TEMP/control-plane-curl.sh"
+          test -s "$RUNNER_TEMP/control-plane-curl.sh"
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          declare -F control_plane_curl > /dev/null
+      - name: Claim durable exact review publication
+        id: publication-context
+        env:
+          ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key }}
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          QUEUE_LEASE_REVISION: ${{ github.event.client_payload.queue_claim.lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/control-plane-curl.sh"
+          printf 'claimed=false\ndecision={}\n' >> "$GITHUB_OUTPUT"
+          queue_url="${QUEUE_URL%/}"
+          payload="$(node -e '
+            const leaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
+            const runAttempt = Number(process.env.RUN_ATTEMPT);
+            if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY) process.exit(1);
+            if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
+            if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              lease_id: process.env.QUEUE_LEASE_ID,
+              item_key: process.env.ITEM_KEY,
+              lease_revision: leaseRevision,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: runAttempt,
+            }));
+          ')"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          : > "$response_file"
+          if status="$(control_plane_curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "content-type: application/json" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/claim")"; then
+            response="$(<"$response_file")"
+            if [ "$status" = "409" ]; then
+              conflict_reason="$(RESPONSE="$response" node <<'NODE'
+                const response = JSON.parse(process.env.RESPONSE || "{}");
+                const safeConflicts = new Set([
+                  "lease_not_active",
+                  "lease_already_claimed",
+                  "lease_decision_unavailable",
+                  "stale_run_attempt",
+                ]);
+                if (!safeConflicts.has(response.error)) process.exit(1);
+                process.stdout.write(response.error);
+          NODE
+              )" || {
+                echo "Unexpected exact-review publication conflict: $response" >&2
+                exit 1
+              }
+              echo "::notice::Skipping exact review publication because lease claim lost safely: $conflict_reason"
+              exit 0
+            fi
+            if [ "$status" != "200" ]; then
+              if [[ "$status" != 5* ]]; then
+                echo "Exact-review publication claim returned HTTP $status: $response" >&2
+                exit 1
+              fi
+            elif RESPONSE="$response" node <<'NODE'
+              const fs = require("node:fs");
+              const response = JSON.parse(process.env.RESPONSE || "{}");
+              const decision = response.decision;
+              const publication = decision?.publication;
+              const producerDecision = publication?.producerDecision;
+              const leaseRevision = Number(response.lease_revision);
+              const claimGeneration = Number(response.claim_generation);
+              const repeatRevision = response.repeat_revision;
+              const publicationLeaseRevision = Number(publication?.leaseRevision);
+              const directItemKey = `${decision?.targetRepo}#${decision?.itemNumber}`;
+              const expectedDeferredItemKey = `${directItemKey}@publish:${publication?.producerRunId}:${publication?.producerRunAttempt}`;
+              const directLifecycleRecovery =
+                response.item_key === directItemKey &&
+                publication?.itemKey === directItemKey &&
+                Number.isInteger(publicationLeaseRevision) &&
+                publicationLeaseRevision === leaseRevision;
+              const directLifecycle = directLifecycleRecovery ? publication?.directLifecycle : null;
+              const directLifecyclePlan = directLifecycle?.plan;
+              const directLifecycleReceiptOutcome = directLifecycle?.receiptOutcome;
+              const directLifecycleKinds = new Set([
+                "router",
+                "router_deferred_coverage",
+                "router_not_required",
+                "requeue",
+                "target_missing",
+                "target_closed",
+                "guarded_open",
+                "policy_noop",
+              ]);
+              const directLifecycleRecoveryReady =
+                directLifecycleRecovery &&
+                directLifecyclePlan &&
+                typeof directLifecyclePlan === "object" &&
+                !Array.isArray(directLifecyclePlan) &&
+                Object.keys(directLifecyclePlan).length === 1 &&
+                directLifecycleKinds.has(directLifecyclePlan.kind) &&
+                ["accepted", "deduped", "superseded"].includes(directLifecycleReceiptOutcome);
+              const deferredPublication = response.item_key === expectedDeferredItemKey;
+              if (
+                response.claimed !== true ||
+                response.protocol_version !== 2 ||
+                typeof repeatRevision !== "boolean" ||
+                response.item_key !== process.env.ITEM_KEY ||
+                (!deferredPublication && !directLifecycleRecovery) ||
+                decision?.sourceAction !== "exact_review_artifact_publish" ||
+                !publication ||
+                !producerDecision ||
+                producerDecision.targetRepo !== decision.targetRepo ||
+                producerDecision.targetBranch !== decision.targetBranch ||
+                producerDecision.itemNumber !== decision.itemNumber ||
+                producerDecision.itemKind !== decision.itemKind
+              ) process.exit(1);
+              if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
+              if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
+              const targetRepo = String(decision.targetRepo);
+              const [targetRepoOwner, targetRepoName] = targetRepo.split("/");
+              const targetSlug = targetRepo.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
+              const values = {
+                artifact_name: publication.artifactName,
+                generation_attempt: publication.producerRunAttempt,
+                producer_run_id: publication.producerRunId,
+                source_sha: publication.sourceSha,
+                decision: JSON.stringify(producerDecision),
+                item_key: publication.itemKey,
+                protocol_version: publication.protocolVersion,
+                lease_revision: publication.leaseRevision ?? "",
+                claim_generation: publication.claimGeneration ?? "",
+                target_repo: targetRepo,
+                target_repo_owner: targetRepoOwner,
+                target_repo_name: targetRepoName,
+                target_slug: targetSlug,
+                target_branch: decision.targetBranch,
+                item_number: decision.itemNumber,
+                item_kind: decision.itemKind,
+                has_command_context: Boolean(producerDecision.commandStatusMarker || producerDecision.statusCommentId),
+                live_proceeded: publication.liveProceeded,
+                live_terminal_noop: publication.liveTerminalNoop,
+                live_terminal_missing: publication.liveTerminalMissing,
+                live_guarded_open: publication.liveGuardedOpen,
+                publisher_lease_id: process.env.QUEUE_LEASE_ID,
+                publisher_item_key: response.item_key,
+                publisher_lease_revision: leaseRevision,
+                publisher_claim_generation: claimGeneration,
+                repeat_revision: repeatRevision,
+                direct_lifecycle_recovery: directLifecycleRecoveryReady,
+                direct_lifecycle_plan: directLifecycleRecoveryReady
+                  ? JSON.stringify(directLifecyclePlan)
+                  : "",
+                direct_lifecycle_receipt_outcome: directLifecycleRecoveryReady
+                  ? directLifecycleReceiptOutcome
+                  : "",
+              };
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, "claimed=true\n");
+              for (const [key, value] of Object.entries(values)) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+              }
+          NODE
+            then
+              exit 0
+            else
+              echo "Exact-review publication claim returned an invalid success payload." >&2
+              exit 1
+            fi
+          fi
+          exit 1
