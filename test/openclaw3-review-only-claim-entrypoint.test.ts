@@ -49,6 +49,7 @@ type Scenario = {
   name: string;
   allowed: boolean;
   queueStatus: number;
+  exitCode?: number;
   error?: string;
   mutate?: (item: Fixture, receipt: Receipt) => void;
   corruptResponse?: (body: Record<string, unknown>) => Record<string, unknown>;
@@ -145,7 +146,8 @@ async function execute(step: Step, scenario: Scenario) {
     }));
     assert.equal(outputs.claimed, scenario.allowed ? "true" : "false", `${scenario.name}: ${stderr}\n${stdout}`);
     assert.notEqual(code, null, "a killed or timed-out child is not a valid rejection");
-    if (scenario.queueStatus === 409) assert.equal(code, 0, "known lost-claim conflicts must terminate safely");
+    if (scenario.exitCode !== undefined) assert.equal(code, scenario.exitCode, "unexpected conflict must remain a visible error");
+    else if (scenario.queueStatus === 409) assert.equal(code, 0, "known lost-claim conflicts must terminate safely");
     if (scenario.allowed) {
       assert.equal(code, 0, stderr);
       assert.equal(outputs.protocol_version, "2");
@@ -181,6 +183,10 @@ const scenarios: Scenario[] = [
   { name: "another run already owns claim", allowed: false, queueStatus: 409, error: "lease_already_claimed", mutate: (item) => { Object.assign(item, { state: "leased", claimedRunId: "777", claimedRunAttempt: 1, claimGeneration: 1, claimProtocolVersion: 2 }); } },
   { name: "stale run attempt", allowed: false, queueStatus: 409, error: "stale_run_attempt", mutate: (item) => { Object.assign(item, { state: "leased", claimedRunId: runId, claimedRunAttempt: 2, claimGeneration: 1, claimProtocolVersion: 2 }); } },
   { name: "mismatched successful response tuple", allowed: false, queueStatus: 200, corruptResponse: (body) => ({ ...body, lease_revision: 99 }) },
+  { name: "authoritative decision repo conflicts with canonical item key", allowed: false, queueStatus: 200, corruptResponse: (body) => ({ ...body, decision: { ...(body.decision as Record<string, unknown>), targetRepo: "example/foreign" } }) },
+  { name: "authoritative decision item conflicts with canonical item key", allowed: false, queueStatus: 200, corruptResponse: (body) => ({ ...body, decision: { ...(body.decision as Record<string, unknown>), itemNumber: 42 } }) },
+  { name: "authoritative decision has unsupported item kind", allowed: false, queueStatus: 200, corruptResponse: (body) => ({ ...body, decision: { ...(body.decision as Record<string, unknown>), itemKind: "unknown" } }) },
+  { name: "unknown conflict reason is not silently acknowledged", allowed: false, queueStatus: 409, error: "lease_not_active", exitCode: 1, mutate: (_item, receipt) => { receipt.lease_id = "forged-lease"; }, corruptResponse: (body) => ({ ...body, error: "unknown_protocol_conflict" }) },
   { name: "authoritative wrong publication policy despite safe dispatch metadata", allowed: false, queueStatus: 200, mutate: (item) => { item.decision.publicationPolicy = "ordinary"; item.leaseDecision.publicationPolicy = "ordinary"; } },
   { name: "authoritative wrong source despite safe dispatch metadata", allowed: false, queueStatus: 200, mutate: (item) => { item.decision.sourceAction = "opened"; item.leaseDecision.sourceAction = "opened"; } },
 ];

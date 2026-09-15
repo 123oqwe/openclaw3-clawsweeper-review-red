@@ -41,3 +41,6 @@ jobs:
       - name: Run planner-owned publisher claim consumer
         if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
         run: node --test test/openclaw3-review-only-publisher-claim.test.ts
+      - name: Run planner-owned public visibility probe contracts
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        run: node --test test/openclaw3-review-only-admission-probe.test.ts

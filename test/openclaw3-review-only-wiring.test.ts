@@ -85,6 +85,16 @@ test("R02 wiring: valid queue receipts are admitted without a nonexistent dispat
   }
 });
 
+test("R02 routing: manual admission and the two queue consumers have disjoint job event gates", () => {
+  const caller = jobs.find(([, job]) => job.uses === "./.github/workflows/hosted-target-admission.yml");
+  assert.ok(caller, "manual admission caller is required");
+  requireGuard(caller[1].if, "github.event_name == 'workflow_dispatch'");
+  requireGuard(sweep.jobs["event-review-apply"].if, "github.event_name == 'repository_dispatch'");
+  requireGuard(sweep.jobs["event-review-apply"].if, "github.event.client_payload.source_action == 'manual_explicit_review'");
+  requireGuard(sweep.jobs["event-review-publish"].if, "github.event_name == 'repository_dispatch'");
+  requireGuard(sweep.jobs["event-review-publish"].if, "github.event.client_payload.source_action == 'exact_review_artifact_publish'");
+});
+
 test("R02 wiring: manual admission consumes the reusable admission result and passes its declared secrets", () => {
   const caller = jobs.find(([, job]) => job.uses === "./.github/workflows/hosted-target-admission.yml");
   assert.ok(caller, "admission workflow must be reachable from sweep");
