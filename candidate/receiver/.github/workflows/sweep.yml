@@ -25,6 +25,7 @@ permissions:
 
 env:
   CLAWSWEEPER_APP_CLIENT_ID: ${{ vars.CLAWSWEEPER_APP_CLIENT_ID }}
+  CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
   EXACT_REVIEW_QUEUE_URL: ${{ vars.EXACT_REVIEW_QUEUE_URL }}
 
 jobs:
@@ -609,7 +610,6 @@ jobs:
       - name: Review exact event item
         id: review-exact-event-item
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
-        continue-on-error: true
         env:
           PR_ADMISSION_FILE: ${{ steps.live-item.outputs.pr_admission_file }}
           OVERSIZED_PR: ${{ steps.live-item.outputs.oversized }}
