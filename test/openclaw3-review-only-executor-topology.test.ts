@@ -70,3 +70,17 @@ test("executor topology: referenced target, live-item and lease outputs have pre
   for (const match of JSON.stringify(steps[consumer]).matchAll(/\bsteps\.([A-Za-z0-9_-]+)\.(?:outputs|outcome)\b/g))
     assert.ok(ids.has(match[1]), `executor references missing or later step ${match[1]}; restore its actual producer or an explicitly reviewed manual-only dependency change`);
 });
+
+// The current candidate ends after the executor; the upstream's later failure
+// fence was not transplanted. Propagate its real exit status at this boundary.
+// Future diagnostic/cleanup continuation needs its own reviewed terminal fence.
+test("executor topology: the current producer cannot soften a real review failure", () => {
+  const consumers = steps.filter((step) => step.id === "review-exact-event-item");
+  assert.equal(consumers.length, 1, "bind failure propagation to the actual uniquely identified executor step");
+  const consumer = consumers[0];
+  assert.ok(/\bpnpm\s+(?:run\s+)?review\b/.test(consumer.run || ""), "retain the existing real review CLI");
+  assert.ok(consumer["continue-on-error"] === undefined || consumer["continue-on-error"] === false,
+    "a failing executor must fail this producer; its upstream final failure fence is absent from this candidate");
+  assert.ok(job["continue-on-error"] === undefined || job["continue-on-error"] === false,
+    "do not mask a failed producer job as workflow success");
+});

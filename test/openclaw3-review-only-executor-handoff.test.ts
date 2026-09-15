@@ -19,10 +19,19 @@ const leaseOwner = "oc3-executor-41001";
 type Step = { id?: string; name?: string; run?: string; env?: Record<string, string> };
 type Event = { event?: string; pid?: number; processGroup?: number; argv?: string[]; env?: Record<string, string>; args?: string[] };
 function reviewStep(path: string) {
-  const steps = YAML.parse(readFileSync(path, "utf8")).jobs?.["event-review-apply"]?.steps as Step[] | undefined;
+  const workflow = YAML.parse(readFileSync(path, "utf8"));
+  const job = workflow.jobs?.["event-review-apply"];
+  const steps = job?.steps as Step[] | undefined;
   const step = steps?.find((entry) => entry.id === "review-exact-event-item" || entry.name === "Review exact event item" || entry.name === "Run the existing review executor");
   assert.ok(step?.run, `actual executor run missing: ${path}`);
-  return step;
+  // Inherit this production control only where declared, workflow then job.
+  // The existing step-env renderer below applies the final override. Do not
+  // render unrelated workflow secrets or supply an undeclared tool-env default.
+  const inheritedEnv: Record<string, string> = {};
+  for (const scope of [workflow.env, job?.env]) {
+    if (scope && Object.hasOwn(scope, "CLAWSWEEPER_CODEX_REASONING_EFFORT")) inheritedEnv.CLAWSWEEPER_CODEX_REASONING_EFFORT = scope.CLAWSWEEPER_CODEX_REASONING_EFFORT;
+  }
+  return { step, inheritedEnv };
 }
 const upstream = "fixtures/upstream-16505cf/.github/workflows/sweep.yml";
 const candidate = "candidate/receiver/.github/workflows/sweep.yml";
@@ -47,7 +56,7 @@ function restoreOwnedModes(path: string) {
 
 async function execute(path: string, scenario: "metadata-denied" | "revoked") {
   assert.equal(process.platform, "linux", "this package requires the existing Ubuntu Hosted lane");
-  const step = reviewStep(path);
+  const { step, inheritedEnv } = reviewStep(path);
   const root = mkdtempSync(join(tmpdir(), "oc3-executor-"));
   const work = join(root, "work");
   const target = join(root, "target");
@@ -129,6 +138,8 @@ async function execute(path: string, scenario: "metadata-denied" | "revoked") {
       "steps.target-read-token.outputs.token": "synthetic-read-token",
       "fromJSON(steps.claim-exact-review-queue.outputs.decision).additionalPrompt || ''": "",
       "vars.CLAWSWEEPER_RELATED_GITHUB_SEARCH || '1'": "0",
+      // Unset repository variable: use the fixed upstream's declared fallback.
+      "vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high'": "high",
       "steps.claim-exact-review-queue.outputs.item_key": itemKey,
       "fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind": "pull_request",
       "steps.claim-exact-review-queue.outputs.lease_id": leased.leaseId,
@@ -149,12 +160,11 @@ async function execute(path: string, scenario: "metadata-denied" | "revoked") {
       assert.ok(Object.hasOwn(values, expression.trim()), `unfrozen executor expression: ${expression}`);
       return values[expression.trim()];
     });
-    const declaredEnv = Object.fromEntries(Object.entries(step.env || {}).map(([key, value]) => [key, render(value)]));
+    const declaredEnv = Object.fromEntries(Object.entries({ ...inheritedEnv, ...step.env }).map(([key, value]) => [key, render(value)]));
     const fixtures = resolve("test/fixtures");
     const env = {
       PATH: process.env.PATH, HOME: root, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0",
       GITHUB_RUN_ID: runId, GITHUB_RUN_ATTEMPT: "1", RUNNER_TEMP: root, GITHUB_OUTPUT: output,
-      CLAWSWEEPER_CODEX_REASONING_EFFORT: "high",
       NODE_OPTIONS: `--import=${pathToFileURL(join(fixtures, "openclaw3-executor-observer.mjs")).href}`,
       GH_BIN: process.execPath, GH_BIN_ARGS: JSON.stringify([join(fixtures, "openclaw3-executor-gh.mjs")]),
       CODEX_BIN: modelSentinel,
