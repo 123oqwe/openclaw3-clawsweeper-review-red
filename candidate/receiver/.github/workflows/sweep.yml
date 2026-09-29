@@ -2501,6 +2501,14 @@ jobs:
             outcome=success
             completion_kind=published
             reason_code=publication_applied
+          elif [ "$PRIOR_JOB_STATUS" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$PUBLISH_COMPLETION_KIND" = "retryable_failure" ] && [ "$PUBLISH_REASON_CODE" = "review_lease_active" ] && [ -n "$PUBLISH_RETRY_AT" ]; then
+            # The Queue accepts this upstream defer instruction as success,
+            # not as a published review. Cancellation remains higher priority.
+            RETRY_AT="$PUBLISH_RETRY_AT" node -e 'if (!Number.isFinite(Date.parse(process.env.RETRY_AT))) process.exit(1)'
+            outcome=success
+            completion_kind=retryable_failure
+            reason_code=review_lease_active
+            retry_at="$PUBLISH_RETRY_AT"
           elif [ "$FAILURE_KIND" = "github_rate_limit" ] || [ "$FAILURE_KIND" = "github_transient" ]; then
             completion_kind=retryable_failure
             reason_code="$FAILURE_KIND"
