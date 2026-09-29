@@ -1403,7 +1403,9 @@ jobs:
             const prepareOnly = process.env.PREPARE_RESULT === 'success' && process.env.MODEL_RESULT === 'skipped';
             const disabledTarget = raw?.targetRepo === 'openclaw/clawhub' && process.env.CLAWHUB_ENABLED !== '1';
             const disabledWithoutLive = disabledTarget && prepareOnly && noReservation && !p.retry_kind && !p.retry_at;
-            const d = JSON.parse(p.effective_decision || (disabledWithoutLive ? p.decision : 'null'));
+            const failedWithoutLive = !p.effective_decision && ['failure','cancelled'].includes(process.env.PREPARE_RESULT) &&
+              process.env.MODEL_RESULT === 'skipped' && noReservation && !p.retry_kind && !p.retry_at;
+            const d = JSON.parse(p.effective_decision || (disabledWithoutLive || failedWithoutLive ? p.decision : 'null'));
             if (!raw || !d || Array.isArray(raw) || Array.isArray(d)) throw Error();
             if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw.targetRepo) || !Number.isSafeInteger(raw.itemNumber) || raw.itemNumber < 1 ||
                 !['issue','pull_request'].includes(raw.itemKind) || !['issues','pull_request'].includes(raw.sourceEvent) ||
@@ -1417,7 +1419,9 @@ jobs:
             const retryKind = p.retry_kind || '', retryAt = p.retry_at || '';
             if (Boolean(retryKind) !== Boolean(retryAt) || (retryKind && (!['coordination','throttle'].includes(retryKind) || !Number.isFinite(Date.parse(retryAt))))) throw Error();
             const branchIsUsable = /^[A-Za-z0-9_.\/-]+$/.test(d.targetBranch) && !/^[0-9]+$/.test(d.targetBranch) && !d.targetBranch.includes('..');
-            if (!branchIsUsable && !(prepareOnly && noReservation && retryKind && Date.parse(retryAt) > Date.now() && isDeepStrictEqual(raw,d))) throw Error();
+            const rawBranchOnly = isDeepStrictEqual(raw,d) && (failedWithoutLive || disabledWithoutLive ||
+              (prepareOnly && noReservation && retryKind && Date.parse(retryAt) > Date.now()));
+            if (!branchIsUsable && !rawBranchOnly) throw Error();
             const [owner,name] = d.targetRepo.split('/');
             out({claimed:'true',protocol_version:'2',item_key:p.item_key,lease_id:p.lease_id,lease_revision:p.lease_revision,claim_generation:p.claim_generation,
               raw_decision:JSON.stringify(raw),decision:JSON.stringify(d),reservation_status:status,reservation_owner:p.reservation_owner||'',reservation_comment_id:p.reservation_comment_id||'',reservation_head_sha:p.reservation_head_sha||'',
@@ -1542,7 +1546,7 @@ jobs:
           build-script: "build:node"
 
       - id: fresh-finalize-live
-        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' && steps.finalize-preparation-context.outputs.retry_kind == '' }}
+        if: ${{ steps.claim-finalize-authority.outputs.claimed == 'true' && steps.finalize-preparation-context.outputs.retry_kind == '' && needs.event-review-prepare.result == 'success' }}
         env:
           CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.decision }}"
           RAW_CLAIM_DECISION: "${{ steps.finalize-preparation-context.outputs.raw_decision }}"
