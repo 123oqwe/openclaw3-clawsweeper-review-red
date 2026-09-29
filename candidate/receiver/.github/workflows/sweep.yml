@@ -2163,6 +2163,7 @@ jobs:
           fi
           exit 1
       - name: Check out trusted receiver source
+        id: source-checkout
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
         uses: actions/checkout@v7
         with:
@@ -2171,8 +2172,9 @@ jobs:
 
       - uses: ./.github/actions/setup-pnpm
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
+        id: setup-publish-pnpm
         with:
-          build-script: build:repair
+          build-script: build:node
 
       - name: Download exact review artifact bundle
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
@@ -2219,3 +2221,453 @@ jobs:
           owner: ${{ steps.publication-context.outputs.target_repo_owner }}
           repositories: ${{ steps.publication-context.outputs.target_repo_name }}
           permission-issues: write
+
+      # Reuse openclaw/clawsweeper@16505cf publisher; only the selected,
+      # validated report crosses into the trusted comment-only runtime.
+      - name: Stage validated exact review artifact
+        id: stage-validated-exact-review-artifact
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/event
+          report=".artifacts/exact-review-bundle/review/${{ steps.publication-context.outputs.item_number }}.md"
+          test -f "$report"
+          cp "$report" "artifacts/event/${{ steps.publication-context.outputs.item_number }}.md"
+
+      - uses: ./.github/actions/setup-state
+        id: setup-state
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.stage-validated-exact-review-artifact.outcome == 'success' }}
+        with:
+          coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-secret: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          records-repo-slugs: ${{ steps.publication-context.outputs.target_slug }}
+          records-item-number: ${{ steps.publication-context.outputs.item_number }}
+          hydrate-records: "true"
+          hydrate-git-state: "false"
+          hydrate-state-blobs: "false"
+          persist-credentials: "false"
+
+      - name: Publish restricted event review comment
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.reviewer-token.outcome == 'success' && steps.setup-state.outcome == 'success' }}
+        id: publish-event-result
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          GH_TOKEN: ${{ steps.reviewer-token.outputs.token }}
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          MIN_AGE_MINUTES: "0"
+          REVIEW_ONLY: "true"
+          EXACT_REVIEW_DECISION: ${{ steps.publication-context.outputs.decision }}
+          EXACT_EVENT_PUBLICATION: "true"
+          EXACT_REVIEW_CLOSE_COVERAGE_DEFERRED: "true"
+          LIVE_PROCEEDED: ${{ steps.publication-context.outputs.live_proceeded }}
+          LIVE_TERMINAL_NOOP: ${{ steps.publication-context.outputs.live_terminal_noop }}
+          LIVE_TERMINAL_MISSING: ${{ steps.publication-context.outputs.live_terminal_missing }}
+          LIVE_GUARDED_OPEN: ${{ steps.publication-context.outputs.live_guarded_open }}
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          EXACT_REVIEW_LEASE_ID: ${{ steps.publication-context.outputs.publisher_lease_id }}
+          EXACT_REVIEW_ITEM_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          EXACT_REVIEW_LEASE_REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.publication-context.outputs.publisher_claim_generation }}
+        run: |
+          set -euo pipefail
+          record_publication_failure_kind() {
+            local error_file="$1"
+            # Only explicit GitHub pressure signals may change global admission;
+            # artifact, tuple, and policy failures must remain ordinary retries.
+            if grep -Eqi 'HTTP 429|secondary rate limit|API rate limit|rate limit (exceeded|reached)' "$error_file"; then
+              echo "failure_kind=github_rate_limit" >> "$GITHUB_OUTPUT"
+            elif grep -Eqi 'HTTP 5[0-9]{2}|status( code)? 5[0-9]{2}|Bad Gateway|Service Unavailable|Gateway Timeout' "$error_file"; then
+              echo "failure_kind=github_transient" >> "$GITHUB_OUTPUT"
+            fi
+          }
+          if [ "$LIVE_PROCEEDED" != "true" ]; then
+            terminal_noop="$LIVE_TERMINAL_NOOP"
+            terminal_missing="$LIVE_TERMINAL_MISSING"
+            guarded_open="$LIVE_GUARDED_OPEN"
+            requeue_latest=false
+            if [ "$LIVE_TERMINAL_NOOP" = "true" ] || [ "$LIVE_TERMINAL_MISSING" = "true" ] || [ "$LIVE_GUARDED_OPEN" = "true" ]; then
+              live_item_error="$(mktemp)"
+              live_locked=false
+              if ! live_item="$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" 2>"$live_item_error")"; then
+                if grep -Eqi 'HTTP 404|Not Found' "$live_item_error" && gh api "repos/$TARGET_REPO" >/dev/null; then
+                  live_state=missing
+                else
+                  record_publication_failure_kind "$live_item_error"
+                  cat "$live_item_error" >&2
+                  rm -f "$live_item_error"
+                  exit 1
+                fi
+              else
+                live_state="$(jq -r '.state' <<< "$live_item")"
+                live_locked="$(jq -r '.locked == true' <<< "$live_item")"
+              fi
+              rm -f "$live_item_error"
+              case "$live_state" in
+                open)
+                  terminal_noop=false
+                  terminal_missing=false
+                  if [ "$live_locked" = "true" ]; then
+                    guarded_open=true
+                  else
+                    guarded_open=false
+                    requeue_latest=true
+                  fi
+                  ;;
+                closed)
+                  terminal_noop=true
+                  terminal_missing=false
+                  guarded_open=false
+                  ;;
+                missing)
+                  terminal_noop=false
+                  terminal_missing=true
+                  guarded_open=false
+                  ;;
+                *)
+                  echo "Unexpected live state for $TARGET_REPO#$ITEM_NUMBER: $live_state" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            {
+              echo "terminal_noop=$terminal_noop"
+              echo "terminal_missing=$terminal_missing"
+              echo "terminal_closed=false"
+              echo "guarded_open=$guarded_open"
+              echo "policy_noop=false"
+              echo "requeue_latest=$requeue_latest"
+              echo "remote_tuple_verified=false"
+              echo "routing_deferred=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          live_item_error="$(mktemp)"
+          if ! live_state="$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" --jq .state 2>"$live_item_error")"; then
+            if grep -Eqi 'HTTP 404|Not Found' "$live_item_error" && gh api "repos/$TARGET_REPO" >/dev/null; then
+              rm -f "$live_item_error"
+              {
+                echo "terminal_noop=false"
+                echo "terminal_missing=true"
+                echo "terminal_closed=false"
+                echo "guarded_open=false"
+                echo "policy_noop=false"
+                echo "requeue_latest=false"
+                echo "remote_tuple_verified=false"
+                echo "routing_deferred=false"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            record_publication_failure_kind "$live_item_error"
+            cat "$live_item_error" >&2
+            rm -f "$live_item_error"
+            exit 1
+          fi
+          rm -f "$live_item_error"
+          if [ "$live_state" = "closed" ]; then
+            {
+              echo "terminal_noop=true"
+              echo "terminal_missing=false"
+              echo "terminal_closed=false"
+              echo "guarded_open=false"
+              echo "policy_noop=false"
+              echo "requeue_latest=false"
+              echo "remote_tuple_verified=false"
+              echo "routing_deferred=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test -f "artifacts/event/$ITEM_NUMBER.md"
+          echo "terminal_noop=false" >> "$GITHUB_OUTPUT"
+          publication_error="$(mktemp)"
+          set +e
+          pnpm run repair:publish-event-result 2>&1 | tee "$publication_error"
+          publication_status="${PIPESTATUS[0]}"
+          set -e
+          if [ "$publication_status" -ne 0 ]; then
+            record_publication_failure_kind "$publication_error"
+            rm -f "$publication_error"
+            exit "$publication_status"
+          fi
+          rm -f "$publication_error"
+
+      - name: Record fallback canonical exact review lifecycle receipt
+        id: record-fallback-canonical-lifecycle-receipt
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' }}
+        env:
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          source scripts/control-plane-curl.sh
+          payload="$(node -e '
+            const revision = Number(process.env.REVISION);
+            if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+              fence_key: process.env.FENCE_KEY,
+              revision,
+              outcome: "accepted",
+              receipt_id: `fallback:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
+            }));
+          ')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          queue_url="${QUEUE_URL%/}"
+          receipt="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/lifecycle/canonical-receipt")"
+          RECEIPT="$receipt" node -e 'const response = JSON.parse(process.env.RECEIPT); if (response?.ok !== true) throw new Error("Lifecycle receipt was not confirmed");'
+
+      - name: Record no-router exact review lifecycle receipt
+        id: record-no-router-lifecycle-receipt
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.record-fallback-canonical-lifecycle-receipt.outcome == 'success' }}
+        env:
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          source scripts/control-plane-curl.sh
+          payload="$(node -e '
+            const revision = Number(process.env.REVISION);
+            if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+              fence_key: process.env.FENCE_KEY,
+              revision,
+              outcome: "not_required",
+              receipt_id: `router-not-required:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
+            }));
+          ')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          queue_url="${QUEUE_URL%/}"
+          receipt="$(control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/lifecycle/router-receipt")"
+          RECEIPT="$receipt" node -e 'const response = JSON.parse(process.env.RECEIPT); if (response?.ok !== true) throw new Error("Lifecycle receipt was not confirmed");'
+
+      - name: Export exact review publication result
+        id: exact-review-publication-result
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
+        env:
+          PRIOR_JOB_STATUS: ${{ job.status }}
+          PUBLISH_OUTCOME: ${{ steps.publish-event-result.outcome }}
+          TERMINAL_NOOP: ${{ steps.publish-event-result.outputs.terminal_noop }}
+          TERMINAL_MISSING: ${{ steps.publish-event-result.outputs.terminal_missing }}
+          TERMINAL_CLOSED: ${{ steps.publish-event-result.outputs.terminal_closed }}
+          GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
+          POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
+          REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
+          REMOTE_TUPLE_VERIFIED: ${{ steps.publish-event-result.outputs.remote_tuple_verified }}
+          CANONICAL_RECEIPT_OUTCOME: ${{ steps.record-fallback-canonical-lifecycle-receipt.outcome }}
+          NO_ROUTER_RECEIPT_OUTCOME: ${{ steps.record-no-router-lifecycle-receipt.outcome }}
+          FAILURE_KIND: ${{ steps.publish-event-result.outputs.failure_kind }}
+          DOWNLOAD_OUTCOME: ${{ steps.download-exact-review-bundle.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate-exact-review-bundle.outcome }}
+          STAGE_OUTCOME: ${{ steps.stage-validated-exact-review-artifact.outcome }}
+          PUBLISH_COMPLETION_KIND: ${{ steps.publish-event-result.outputs.completion_kind }}
+          PUBLISH_REASON_CODE: ${{ steps.publish-event-result.outputs.reason_code }}
+          PUBLISH_RETRY_AT: ${{ steps.publish-event-result.outputs.retry_at }}
+          ERROR_FINGERPRINT: ${{ steps.publish-event-result.outputs.error_fingerprint }}
+          STATE_WRITER_JSON: ${{ steps.publish-event-result.outputs.state_writer_json }}
+        run: |
+          set -euo pipefail
+          outcome=failure
+          completion_kind=permanent_failure
+          reason_code=unknown_failure
+          retry_at=
+          requeue_latest="$REQUEUE_LATEST"
+          # Keep upstream classifications, but cancellation and missing durable
+          # receipts may never be converted into successful publication.
+          if [ "$PRIOR_JOB_STATUS" = "cancelled" ]; then
+            outcome=cancelled
+            completion_kind=retryable_failure
+            reason_code=workflow_cancelled
+          elif [ "$PRIOR_JOB_STATUS" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$REMOTE_TUPLE_VERIFIED" = "true" ] && [ "$CANONICAL_RECEIPT_OUTCOME" = "success" ] && [ "$NO_ROUTER_RECEIPT_OUTCOME" = "success" ] && [ "$PUBLISH_COMPLETION_KIND" = "published" ] && [ "$PUBLISH_REASON_CODE" = "publication_applied" ]; then
+            outcome=success
+            completion_kind=published
+            reason_code=publication_applied
+          elif [ "$FAILURE_KIND" = "github_rate_limit" ] || [ "$FAILURE_KIND" = "github_transient" ]; then
+            completion_kind=retryable_failure
+            reason_code="$FAILURE_KIND"
+            retry_at="$PUBLISH_RETRY_AT"
+          elif [ "$DOWNLOAD_OUTCOME" = "failure" ]; then
+            completion_kind=retryable_failure
+            reason_code=artifact_unavailable
+          elif [ "$VALIDATE_OUTCOME" = "failure" ] || [ "$STAGE_OUTCOME" = "failure" ]; then
+            completion_kind=permanent_failure
+            reason_code=invalid_artifact
+          elif [ "$PUBLISH_OUTCOME" = "success" ] && [ "$REMOTE_TUPLE_VERIFIED" = "true" ] && { [ "$CANONICAL_RECEIPT_OUTCOME" != "success" ] || [ "$NO_ROUTER_RECEIPT_OUTCOME" != "success" ]; }; then
+            completion_kind=retryable_failure
+            reason_code=state_contention
+          elif [ "$PUBLISH_COMPLETION_KIND" = "permanent_failure" ]; then
+            completion_kind=permanent_failure
+            reason_code="${PUBLISH_REASON_CODE:-unknown_failure}"
+          elif [ "$PUBLISH_COMPLETION_KIND" = "retryable_failure" ]; then
+            completion_kind=retryable_failure
+            reason_code="${PUBLISH_REASON_CODE:-unknown_failure}"
+            retry_at="$PUBLISH_RETRY_AT"
+          elif [ "$PRIOR_JOB_STATUS" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ]; then
+            if [ "$PUBLISH_COMPLETION_KIND" = "superseded" ] && { [ "$PUBLISH_REASON_CODE" = "remote_newer_tuple" ] || [ "$PUBLISH_REASON_CODE" = "remote_closed" ]; }; then
+              outcome=success
+              completion_kind=superseded
+              reason_code="$PUBLISH_REASON_CODE"
+            elif [ "$REQUEUE_LATEST" = "true" ]; then
+              completion_kind=retryable_failure
+              reason_code=unknown_failure
+            elif [ "$TERMINAL_NOOP" = "true" ] || [ "$TERMINAL_MISSING" = "true" ] || [ "$TERMINAL_CLOSED" = "true" ] || [ "$GUARDED_OPEN" = "true" ] || [ "$POLICY_NOOP" = "true" ]; then
+              outcome=success
+              completion_kind=superseded
+              reason_code=live_terminal
+            fi
+          fi
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+          echo "completion_kind=$completion_kind" >> "$GITHUB_OUTPUT"
+          echo "reason_code=$reason_code" >> "$GITHUB_OUTPUT"
+          echo "requeue_latest=$requeue_latest" >> "$GITHUB_OUTPUT"
+          echo "direct_requeue=false" >> "$GITHUB_OUTPUT"
+          if [ -n "$ERROR_FINGERPRINT" ]; then
+            echo "error_fingerprint=$ERROR_FINGERPRINT" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$retry_at" ]; then
+            echo "retry_at=$retry_at" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$outcome" = "failure" ] && { [ "$FAILURE_KIND" = "github_rate_limit" ] || [ "$FAILURE_KIND" = "github_transient" ]; }; then
+            echo "failure_kind=$FAILURE_KIND" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$STATE_WRITER_JSON" ]; then
+            echo "state_writer_json=$STATE_WRITER_JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Complete durable exact review publication
+        id: complete-exact-review-publication
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
+        env:
+          SOURCE_CHECKOUT_OUTCOME: ${{ steps.source-checkout.outcome }}
+          CLAIM_GENERATION: ${{ steps.publication-context.outputs.publisher_claim_generation }}
+          ITEM_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          LEASE_REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          OUTCOME: ${{ steps.exact-review-publication-result.outputs.outcome || 'failure' }}
+          FAILURE_KIND: ${{ steps.exact-review-publication-result.outputs.failure_kind }}
+          COMPLETION_KIND: ${{ steps.exact-review-publication-result.outputs.completion_kind }}
+          REASON_CODE: ${{ steps.exact-review-publication-result.outputs.reason_code }}
+          ERROR_FINGERPRINT: ${{ steps.exact-review-publication-result.outputs.error_fingerprint }}
+          RETRY_AT: ${{ steps.exact-review-publication-result.outputs.retry_at }}
+          STATE_WRITER_JSON: ${{ steps.exact-review-publication-result.outputs.state_writer_json }}
+          PUBLISH_COMPLETION_KIND: ${{ steps.publish-event-result.outputs.completion_kind }}
+          PUBLISH_REASON_CODE: ${{ steps.publish-event-result.outputs.reason_code }}
+          TERMINAL_NOOP: ${{ steps.publish-event-result.outputs.terminal_noop }}
+          TERMINAL_MISSING: ${{ steps.publish-event-result.outputs.terminal_missing }}
+          TERMINAL_CLOSED: ${{ steps.publish-event-result.outputs.terminal_closed }}
+          GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
+          POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
+          REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
+          DIRECT_LIFECYCLE_REQUEUE: ${{ steps.exact-review-publication-result.outputs.direct_requeue }}
+          QUEUE_LEASE_ID: ${{ steps.publication-context.outputs.publisher_lease_id }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ "$SOURCE_CHECKOUT_OUTCOME" == "success" ]]; then
+            source scripts/control-plane-curl.sh
+          else
+            source "$RUNNER_TEMP/control-plane-curl.sh"
+          fi
+          queue_url="${QUEUE_URL%/}"
+          payload="$(node -e '
+            const leaseRevision = Number(process.env.LEASE_REVISION);
+            const claimGeneration = Number(process.env.CLAIM_GENERATION);
+            const runAttempt = Number(process.env.RUN_ATTEMPT);
+            if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY) process.exit(1);
+            if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
+            if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
+            if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+            const outcome = ["success", "failure", "cancelled"].includes(process.env.OUTCOME)
+              ? process.env.OUTCOME
+              : "failure";
+            const failureKind = ["github_rate_limit", "github_transient"].includes(process.env.FAILURE_KIND)
+              ? process.env.FAILURE_KIND
+              : undefined;
+            const completionKind = ["published", "superseded", "deferred", "retryable_failure", "refresh_required", "permanent_failure"].includes(process.env.COMPLETION_KIND)
+              ? process.env.COMPLETION_KIND
+              : undefined;
+            const reasonCode = ["publication_applied", "remote_newer_tuple", "remote_closed", "live_terminal", "github_rate_limit", "github_transient", "state_contention", "review_lease_active", "workflow_cancelled", "artifact_unavailable", "artifact_expired", "close_coverage_retry", "close_coverage_deferred", "invalid_artifact", "missing_record_tuple", "tuple_protocol_invalid", "policy_invariant", "unknown_failure", "retry_exhausted"].includes(process.env.REASON_CODE)
+              ? process.env.REASON_CODE
+              : undefined;
+            const errorFingerprint = /^[A-Za-z0-9:._-]{1,200}$/.test(process.env.ERROR_FINGERPRINT || "")
+              ? process.env.ERROR_FINGERPRINT
+              : undefined;
+            const retryAt = String(process.env.RETRY_AT || "").trim();
+            if (retryAt && !Number.isFinite(Date.parse(retryAt))) process.exit(1);
+            if (!completionKind || !reasonCode) process.exit(1);
+            const directLifecycleRequeue = process.env.DIRECT_LIFECYCLE_REQUEUE === "true";
+            const lifecycleTerminal =
+              directLifecycleRequeue || process.env.REQUEUE_LATEST === "true"
+                ? "requeue"
+                : ["retryable_failure", "refresh_required"].includes(completionKind)
+                  ? "requeue"
+                  : process.env.TERMINAL_MISSING === "true"
+                    ? "target_missing"
+                    : process.env.TERMINAL_CLOSED === "true" || process.env.TERMINAL_NOOP === "true"
+                      ? "target_closed"
+                      : process.env.POLICY_NOOP === "true"
+                        ? "policy_noop"
+                        : process.env.GUARDED_OPEN === "true"
+                          ? "guarded_open"
+                          : completionKind === "superseded"
+                            ? reasonCode === "remote_closed"
+                              ? "target_closed"
+                              : "superseded"
+                            : completionKind === "permanent_failure"
+                              ? "failure"
+                            : undefined;
+            let stateWriter;
+            try {
+              const parsed = JSON.parse(process.env.STATE_WRITER_JSON || "");
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) stateWriter = parsed;
+            } catch {}
+            process.stdout.write(JSON.stringify({
+              lease_id: process.env.QUEUE_LEASE_ID,
+              item_key: process.env.ITEM_KEY,
+              lease_revision: leaseRevision,
+              claim_generation: claimGeneration,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: runAttempt,
+              outcome,
+              completion_kind: completionKind,
+              reason_code: reasonCode,
+              ...(errorFingerprint ? { error_fingerprint: errorFingerprint } : {}),
+              ...(retryAt ? { retry_at: retryAt } : {}),
+              ...(outcome === "failure" && failureKind ? { failure_kind: failureKind } : {}),
+              ...(directLifecycleRequeue ? { direct_lifecycle_requeue: true } : {}),
+              ...(lifecycleTerminal ? { lifecycle_terminal_disposition: lifecycleTerminal } : {}),
+              ...(stateWriter ? { state_writer: stateWriter } : {}),
+            }));
+          ')"
+          if control_plane_curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/complete" >/dev/null; then
+            exit 0
+          fi
+          exit 1
+
+      - name: Fail unsuccessful exact review publication
+        id: fail-exact-review-publication
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && (steps.exact-review-publication-result.outputs.outcome != 'success' || steps.complete-exact-review-publication.outcome != 'success') }}
+        run: exit 1
