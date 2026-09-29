@@ -64,6 +64,8 @@ async function session(pullRequest = false) {
   mkdirSync(bin); mkdirSync(join(root, "scripts")); mkdirSync(join(root, "artifacts/event"), { recursive: true });
   cpSync(join(source, "dist"), join(root, "dist"), { recursive: true });
   cpSync(join(source, "config"), join(root, "config"), { recursive: true });
+  // Real apply-decisions eagerly reads its upstream proof prompt even in comment-only mode.
+  cpSync(join(source, "prompts"), join(root, "prompts"), { recursive: true });
   cpSync(join(source, "package.json"), join(root, "package.json"));
   cpSync(join(source, "scripts/control-plane-curl.sh"), join(root, "scripts/control-plane-curl.sh"));
   cpSync(join(source, "scripts/control-plane-curl.sh"), join(root, "control-plane-curl.sh"));
