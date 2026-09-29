@@ -54,8 +54,10 @@ function diagnosticFields(value: any, keys: string[]) {
   return Object.fromEntries(keys.filter((key) => ["string", "number", "boolean"].includes(typeof value?.[key])).map((key) => [key, diagnosticText(value[key], 180)]));
 }
 function attachDiagnostics(error: unknown, diagnostics: string): never {
-  if (error instanceof Error) { error.message += `\n${diagnostics}`; throw error; }
-  throw new Error(`${diagnosticText(error, 500)}\n${diagnostics}`);
+  // Report the already bounded/redacted payload independently of the reporter's
+  // rendering of a previously created AssertionError, then preserve that error.
+  process.stderr.write(`${diagnostics}\n`);
+  throw error;
 }
 async function session(pullRequest = false) {
   const root = mkdtempSync(join(tmpdir(), "oc3-pub-")), bin = join(root, "bin");
