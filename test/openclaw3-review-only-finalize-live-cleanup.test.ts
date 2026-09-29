@@ -338,12 +338,49 @@ test("R06-B disabled ClawHub uses the actual resolver, narrow context exception 
     assert.equal(noOp.code, 0, noOp.stderr); assert.equal(noOp.out.proceed, "false");
     assert.equal(noOp.out.terminal_disposition, "policy_noop"); assert.deepEqual(noOp.trace, [], "disabled means no target GH reads, not merely no model");
 
+    await t.test("disabled raw numeric branch remains unchanged through actual context and fresh no-op", () => {
+      const raw = { ...clawhub, targetBranch: "41" };
+      const resolved = s.run(resolver, resolverValues("", raw));
+      assert.equal(resolved.code, 0, resolved.stderr); assert.equal(resolved.out.target_enabled, "false");
+      assert.deepEqual(resolved.trace, []);
+      const r = s.run(context, contextValuesFor({ ...receipt, decision: JSON.stringify(raw) }));
+      assert.equal(r.code, 0, r.stderr); assert.equal(r.out.claimed, "true");
+      assert.deepEqual(JSON.parse(r.out.raw_decision), raw); assert.deepEqual(JSON.parse(r.out.decision), raw);
+      assert.equal(r.out.target_branch, "41"); assert.deepEqual(r.trace, []);
+      const live = s.run(fresh, freshValuesFor(r.out), { repository: "openclaw/clawhub" });
+      assert.equal(live.code, 0, live.stderr); assert.equal(live.out.proceed, "false");
+      assert.equal(live.out.terminal_noop, "true"); assert.equal(live.out.terminal_disposition, "policy_noop");
+      assert.equal(live.out.target_branch, "41"); assert.deepEqual(JSON.parse(live.out.decision), raw);
+      assert.deepEqual(live.trace, [], "disabled numeric raw branch must not trigger default-branch discovery");
+    });
+    // Platform results/empty outputs are synthetic; the context script is real.
+    // Acceptance here permits lease recovery, not terminal success. The topology
+    // suite requires prepare success before fresh can run, while the Queue suite
+    // executes failed/cancelled completion and the final failure gate.
+    for (const prepared of ["failure", "cancelled"]) for (const targetBranch of ["main", "41"])
+      await t.test(`${prepared} prepare retains raw ${targetBranch} context for failure closure only`, () => {
+        const raw = { ...clawhub, targetBranch };
+        const r = s.run(context, contextValuesFor({ ...receipt, decision: JSON.stringify(raw) }, "", "skipped", prepared));
+        assert.equal(r.code, 0, r.stderr); assert.equal(r.out.claimed, "true");
+        assert.deepEqual(JSON.parse(r.out.raw_decision), raw); assert.deepEqual(JSON.parse(r.out.decision), raw);
+        assert.equal(r.out.target_branch, targetBranch); assert.equal(Object.keys(r.out).length, 20);
+        for (const key of ["reservation_status", "reservation_owner", "reservation_comment_id", "reservation_head_sha", "retry_kind", "retry_at"])
+          assert.equal(r.out[key], "", `${prepared} recovery cannot invent ${key}`);
+        noTerminal(r.out); assert.deepEqual(r.trace, []);
+      });
+
     const future = new Date(Date.now() + 60_000).toISOString();
+    const numeric = { ...clawhub, targetBranch: "41" };
     const rejections: Array<{ name: string; patch?: Record<string, string>; flag?: string; model?: string; prepared?: string }> = [
       { name: "enabled ClawHub cannot invent effective decision", flag: "1" },
       { name: "different target cannot use disabled fallback", patch: { decision: JSON.stringify(decision), item_key: `${repo}#41` } },
       { name: "model success cannot use disabled fallback", model: "success" },
-      { name: "prepare failure cannot use disabled fallback", prepared: "failure" },
+      { name: "failed prepare with model success cannot use recovery", prepared: "failure", model: "success" },
+      { name: "failed prepare with posted reservation cannot use raw recovery", prepared: "failure", patch: { reservation_status: "posted", reservation_owner: owner, reservation_comment_id: String(id), reservation_head_sha: head } },
+      { name: "cancelled prepare with typed retry cannot use raw recovery", prepared: "cancelled", patch: { retry_kind: "coordination", retry_at: future } },
+      { name: "enabled numeric branch cannot use disabled exception", flag: "1", patch: { decision: JSON.stringify(numeric), effective_decision: JSON.stringify(numeric) } },
+      { name: "ordinary numeric target cannot use disabled exception", patch: { decision: JSON.stringify({ ...decision, targetBranch: "41" }), effective_decision: JSON.stringify({ ...decision, targetBranch: "41" }), item_key: `${repo}#41` } },
+      { name: "disabled numeric branch exception cannot rewrite raw decision", patch: { decision: JSON.stringify(numeric), effective_decision: JSON.stringify({ ...numeric, targetBranch: "42" }) } },
       { name: "posted receipt cannot use disabled fallback", patch: { reservation_status: "posted", reservation_owner: owner, reservation_comment_id: String(id), reservation_head_sha: head } },
       { name: "residual owner is not an empty reservation", patch: { reservation_owner: owner } },
       { name: "residual comment is not an empty reservation", patch: { reservation_comment_id: String(id) } },
@@ -365,9 +402,9 @@ test("R06-B disabled ClawHub uses the actual resolver, narrow context exception 
         { method: "GET", path: "repos/openclaw/clawhub/issues/41" }, { method: "GET", path: "repos/openclaw/clawhub/pulls/41" },
       ]);
     });
-    for (const command of [{ commandStatusMarker: "<!-- clawsweeper-command-status:review:test -->" }, { statusCommentId: 123 }])
-      await t.test(`disabled command context rejects ${Object.keys(command)[0]} before GH`, () => {
-        const d = { ...clawhub, ...command };
+    for (const targetBranch of ["main", "41"]) for (const command of [{ commandStatusMarker: "<!-- clawsweeper-command-status:review:test -->" }, { statusCommentId: 123 }])
+      await t.test(`disabled ${targetBranch} command context rejects ${Object.keys(command)[0]} before GH`, () => {
+        const d = { ...clawhub, targetBranch, ...command };
         const r = s.run(context, contextValuesFor({ ...receipt, decision: JSON.stringify(d) }));
         assert.equal(r.code, 0, r.stderr);
         const live = s.run(fresh, freshValuesFor(r.out), { repository: "openclaw/clawhub" });

@@ -454,6 +454,7 @@ const extraStages: Record<string, Outputs> = {
 type Scenario = {
   rawBranch?: string; mutateReceipt?: (receipt: Outputs) => void; unclaimed?: boolean;
   trailingQueueUrl?: boolean;
+  prepareFailure?: "failure" | "cancelled";
   unresolvedBranch?: "coordination" | "throttle";
   held?: "coordination" | "throttle"; model?: "success" | "failure" | "cancelled";
   terminal?: "target_closed" | "target_missing" | "guarded_open" | "policy_noop";
@@ -468,7 +469,7 @@ function candidateExpressions(s: Session, inputs: Record<string, Stage>, receipt
   const dispatchDecision = s.owned.decision;
   Object.assign(values, {
     "toJSON(needs.event-review-prepare.outputs)": JSON.stringify(receipt),
-    "needs.event-review-prepare.result": "success", "needs.event-review-apply.result": scenario.model ?? (scenario.held || scenario.unresolvedBranch || scenario.terminal || scenario.unclaimed ? "skipped" : "success"),
+    "needs.event-review-prepare.result": scenario.prepareFailure || "success", "needs.event-review-apply.result": scenario.model ?? (scenario.prepareFailure || scenario.held || scenario.unresolvedBranch || scenario.terminal || scenario.unclaimed ? "skipped" : "success"),
     "toJSON(steps.finalize-preparation-context.outputs)": JSON.stringify(inputs["finalize-preparation-context"].outputs),
     "vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL": s.queueUrl,
     "vars.CLAWSWEEPER_ENABLE_CLAWHUB": "",
@@ -486,7 +487,7 @@ function candidateExpressions(s: Session, inputs: Record<string, Stage>, receipt
   return values;
 }
 async function candidateScenario(s: Session, allJobs: Record<string, Job>, scenario: Scenario = {}) {
-  const decision: ReviewDecision = { ...s.owned.decision, targetBranch: scenario.unresolvedBranch ? s.owned.decision.targetBranch : "main" };
+  const decision: ReviewDecision = { ...s.owned.decision, targetBranch: scenario.prepareFailure || scenario.unresolvedBranch ? s.owned.decision.targetBranch : "main" };
   const finalize = allJobs["event-review-finalize"];
   const actual = (id: string) => step(finalize, id, "candidate event-review-finalize");
   const initial = await s.claim(step(allJobs["event-review-prepare"], "claim-exact-review-queue", "candidate prepare"), 1, scenario.unclaimed);
@@ -497,14 +498,20 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
     Object.assign(inputs["live-item"].outputs, { proceed: "false", admission_retry: "true", retry_kind: scenario.unresolvedBranch, retry_at: retryAt });
     inputs["reserve-exact-review-lease"] = { outcome: "skipped", outputs: {} };
   }
-  const noReservation = scenario.held || scenario.terminal || scenario.unresolvedBranch;
+  // Platform failure before live/reservation is a controlled stage input. The
+  // claim, output mappings, finalizer shell, fences and Queue completion are real.
+  if (scenario.prepareFailure) {
+    inputs["live-item"] = { outcome: "skipped", outputs: {} };
+    inputs["reserve-exact-review-lease"] = { outcome: "skipped", outputs: {} };
+  }
+  const noReservation = scenario.prepareFailure || scenario.held || scenario.terminal || scenario.unresolvedBranch;
   const trustedReservation = { status: scenario.held ? "held" : noReservation ? "" : "posted", owner: noReservation ? "" : `github-run-${runId}-1`, comment_id: noReservation ? "" : "41010", head_sha: noReservation ? "" : sourceSha, retry_kind: scenario.held || "", retry_at: scenario.held ? retryAt : "" };
   // Trusted preparation transport is synthetic, but its claim was just obtained
   // from the actual Queue. Actual prepare output mappings supply needs strings.
   const preparationValues: Outputs = {};
   const claimOutputs = { ...Object.fromEntries(["claimed", "protocol_version", "item_key", "lease_id", "lease_revision", "claim_generation", "decision", "repeat_revision"].map((key) => [key, ""])), ...initial };
   const reservationOutputs = scenario.unclaimed ? Object.fromEntries(Object.keys(trustedReservation).map((key) => [key, ""])) : trustedReservation;
-  for (const [id, outputs] of Object.entries({ "claim-exact-review-queue": claimOutputs, "live-item": { decision: scenario.unclaimed ? "" : JSON.stringify(decision), retry_kind: scenario.unresolvedBranch || "", retry_at: scenario.unresolvedBranch ? retryAt : "" }, "reserve-exact-review-lease": reservationOutputs })) {
+  for (const [id, outputs] of Object.entries({ "claim-exact-review-queue": claimOutputs, "live-item": { decision: scenario.unclaimed || scenario.prepareFailure ? "" : JSON.stringify(decision), retry_kind: scenario.unresolvedBranch || "", retry_at: scenario.unresolvedBranch ? retryAt : "" }, "reserve-exact-review-lease": reservationOutputs })) {
     for (const [key, value] of Object.entries(outputs)) preparationValues[`steps.${id}.outputs.${key}`] = value;
   }
   preparationValues["steps.live-item.outputs.retry_kind || steps.reserve-exact-review-lease.outputs.retry_kind"] = scenario.unresolvedBranch || trustedReservation.retry_kind;
@@ -521,7 +528,7 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
     assert.equal(result.code, 0, result.stderr); assert.deepEqual(Object.keys(result.outputs).sort(), [...resultFields].sort());
     // The independent R02 suite runs the actual cleanup shell and helpers. Here
     // only its stage outcome is a controlled input to result propagation.
-    inputs["finalize-owner-cleanup"] = { outputs: { status: result.outputs.cleanup_mode === "none" ? "skipped" : result.outputs.cleanup_mode === "expire" ? "expired" : "deleted" }, outcome: scenario.cleanupFailure ? "failure" : "success" };
+    inputs["finalize-owner-cleanup"] = { outputs: { status: result.outputs.cleanup_mode === "none" ? "skipped" : result.outputs.cleanup_mode === "expire" ? "expired" : "deleted" }, outcome: scenario.prepareFailure ? "skipped" : scenario.cleanupFailure ? "failure" : "success" };
     let completed: Awaited<ReturnType<Session["run"]>> | undefined;
     if (result.outputs.completion_required === "true") {
       if (scenario.completeLost) {
@@ -584,13 +591,13 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
   // suite. This fixture supplies its frozen output, not model-controlled flags.
   // The actual producer retry outputs are independently exercised in the GH
   // suite. The frozen fresh guard skips known preparation deferral and held.
-  inputs["fresh-finalize-live"] = scenario.held || scenario.unresolvedBranch ? { outcome: "skipped", outputs: {} } : { outcome: "success", outputs: {
+  inputs["fresh-finalize-live"] = scenario.prepareFailure || scenario.held || scenario.unresolvedBranch ? { outcome: "skipped", outputs: {} } : { outcome: "success", outputs: {
     proceed: scenario.terminal ? "false" : "true", terminal_noop: scenario.terminal ? "true" : "false",
     terminal_missing: scenario.terminal === "target_missing" ? "true" : "false", guarded_open: scenario.terminal === "guarded_open" ? "true" : "false",
     admission_retry: "false", retry_kind: "", retry_at: "", target_branch: "main", decision: JSON.stringify(decision),
     terminal_disposition: scenario.terminal || "", head_sha: sourceSha,
   } };
-  if (!scenario.held && !scenario.unresolvedBranch && !scenario.terminal && (!scenario.model || scenario.model === "success")) {
+  if (!scenario.prepareFailure && !scenario.held && !scenario.unresolvedBranch && !scenario.terminal && (!scenario.model || scenario.model === "success")) {
     const created = await runStage(s, inputs, step(allJobs["event-review-apply"], "create-exact-review-bundle", "candidate model"));
     assert.equal(created.code, 0, created.stderr); assert.deepEqual(s.cliCommands(), ["create"]);
     const directory = join(s.root, ".artifacts/exact-review-bundle"), manifestPath = join(directory, "manifest.json");
@@ -648,7 +655,7 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
       assert.equal((await s.publications()).length, 0);
     }
     else { assert.equal(s.trace.at(-1)?.status, 200); assert.equal(s.trace.at(-1)?.response.lifecycle_state, scenario.terminal); assert.equal(recorded.outputs.recorded, "true"); assert.equal(recorded.outputs.terminal_disposition, scenario.terminal); }
-  } else if (!scenario.held && !scenario.unresolvedBranch && (!scenario.model || scenario.model === "success") && !scenario.corruptBundle) {
+  } else if (!scenario.prepareFailure && !scenario.held && !scenario.unresolvedBranch && (!scenario.model || scenario.model === "success") && !scenario.corruptBundle) {
     if (scenario.deniedEnqueue) s.workerEnv.CLAWSWEEPER_WEBHOOK_SECRET = "synthetic-different-verifier-secret";
     const queued = await execute("queue-exact-review-publication");
     assert.equal(queued.code, scenario.deniedEnqueue ? 1 : 0, queued.stderr);
@@ -664,7 +671,7 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
     }
   }
   const done = await finish();
-  const primaryFailure = Boolean(scenario.corruptBundle || scenario.deniedEnqueue || scenario.noAdmission || scenario.model === "failure" || scenario.model === "cancelled");
+  const primaryFailure = Boolean(scenario.prepareFailure || scenario.corruptBundle || scenario.deniedEnqueue || scenario.noAdmission || scenario.model === "failure" || scenario.model === "cancelled");
   assert.equal(done.result.outputs.failed, String(primaryFailure));
   assert.equal(done.result.outputs.completion_required, "true");
   assert.equal(done.failed.code, primaryFailure || scenario.completeLost || scenario.cleanupFailure ? 1 : 0, done.failed.stderr);
@@ -674,15 +681,35 @@ async function candidateScenario(s: Session, allJobs: Record<string, Job>, scena
     assert.equal((await s.state()).items[itemKey].claimGeneration, 2);
   } else {
     assert.equal(done.completed?.code, 0, done.completed?.stderr); assert.equal(s.trace.at(-1)?.status, 200);
-    if (scenario.held || scenario.unresolvedBranch || scenario.corruptBundle || scenario.noAdmission || scenario.deniedEnqueue || scenario.model === "failure" || scenario.model === "cancelled") {
+    if (scenario.prepareFailure || scenario.held || scenario.unresolvedBranch || scenario.corruptBundle || scenario.noAdmission || scenario.deniedEnqueue || scenario.model === "failure" || scenario.model === "cancelled") {
       const pending = (await s.state()).items[itemKey]; assert.equal(pending.state, "pending"); assert.equal(pending.leaseId, undefined);
       if (scenario.held || scenario.unresolvedBranch || scenario.corruptBundle || scenario.noAdmission) {
         assert.equal(done.result.outputs.retry_kind, scenario.held || scenario.unresolvedBranch || "coordination");
         assert.ok(Date.parse(done.result.outputs.retry_at) > Date.now());
         assert.equal(pending.attempts, s.owned.attempts); assert.equal(pending.reviewFailureAttempts || 0, s.owned.reviewFailureAttempts || 0);
       }
-      assert.equal(done.result.outputs.outcome, scenario.model === "cancelled" ? "cancelled" : "failure");
+      assert.equal(done.result.outputs.outcome, scenario.prepareFailure === "cancelled" || scenario.model === "cancelled" ? "cancelled" : "failure");
       assert.equal((await s.publications()).length, 0);
+      if (scenario.prepareFailure) {
+        assert.equal(receipt.effective_decision, "");
+        assert.deepEqual(JSON.parse(context.outputs.decision), s.owned.decision);
+        for (const field of ["reservation_status", "reservation_owner", "reservation_comment_id", "reservation_head_sha", "retry_kind", "retry_at"]) assert.equal(receipt[field], "");
+        assert.equal(inputs["fresh-finalize-live"].outcome, "skipped");
+        assert.equal(inputs["finalize-owner-cleanup"].outcome, "skipped");
+        assert.equal(done.result.outputs.cleanup_mode, "none");
+        assert.equal(done.result.outputs.retry_kind, ""); assert.equal(done.result.outputs.retry_at, "");
+        assert.equal(s.trace.at(-1)?.request.outcome, scenario.prepareFailure);
+        assert.equal(s.trace.at(-1)?.request.retry_kind, undefined); assert.equal(s.trace.at(-1)?.request.retry_at, undefined);
+        // The existing Queue's ordinary workflow failure path consumes a retry;
+        // recovery must not disguise infrastructure failure as a typed deferral.
+        assert.equal(pending.attempts, s.owned.attempts + 1);
+        assert.equal(pending.reviewFailureAttempts, Number(s.owned.reviewFailureAttempts || 0) + 1);
+        assert.equal(pending.reviewRecoveryReason, scenario.prepareFailure === "cancelled" ? "workflow_cancelled" : "workflow_failed");
+        for (const field of ["leaseId", "claimedRunId", "claimedRunAttempt", "claimGeneration"]) assert.equal(pending[field], undefined);
+        assert.deepEqual(s.cliCommands(), []);
+        assert.ok(s.trace.every((entry) => !entry.signed), "failed preparation cannot sign publication or terminal success");
+        assert.deepEqual(s.trace.map((entry) => entry.path), ["claim", "heartbeat", "claim", "heartbeat", "complete"].map((path) => `/internal/exact-review/${path}`));
+      }
       if (scenario.unresolvedBranch) {
         assert.deepEqual(JSON.parse(receipt.effective_decision), s.owned.decision, "unresolved branch authority stays raw");
         assert.equal(receipt.reservation_status, ""); assert.equal(inputs["fresh-finalize-live"].outcome, "skipped");
@@ -717,6 +744,8 @@ test("R06-B candidate actual trusted finalizer against real Worker/Queue", async
     ["trailing queue URL preserves exact routes for signed terminal and completion", { trailingQueueUrl: true, terminal: "target_closed" }],
     ["effective branch correction preserves raw Queue authority", { rawBranch: "41" }],
     ["unresolved preparation branch defers with raw authority and releases the lease", { rawBranch: "41", unresolvedBranch: "coordination" }],
+    ["failed preparation before effective decision completes the real lease as failure", { prepareFailure: "failure" }],
+    ["cancelled preparation before effective decision releases a numeric raw branch without target work", { prepareFailure: "cancelled", rawBranch: "41" }],
     ["legitimate unclaimed receipt is a no-op", { unclaimed: true }],
     ["first real heartbeat loses without taking over the newer generation", { firstLost: true }],
     ["unknown first-fence conflict cannot become a safe no-op", { firstLost: true, unknownFirst: true }],
@@ -747,6 +776,7 @@ test("R06-B candidate actual trusted finalizer against real Worker/Queue", async
     ["effective target", (r: Outputs) => { r.effective_decision = JSON.stringify({ ...decision, itemNumber: 42 }); }],
     ["invalid posted owner", (r: Outputs) => { r.reservation_owner = "invalid owner"; }],
     ["malformed trusted retry", (r: Outputs) => { r.retry_kind = "throttle"; r.retry_at = "not-a-timestamp"; }],
+    ["successful posted preparation without effective decision", (r: Outputs) => { r.effective_decision = ""; }],
   ] as Array<[string, (receipt: Outputs) => void]>) await t.test(`context rejects ${name} before first Queue operation`, async () => {
     await withSession(async (s) => { await candidateScenario(s, allJobs, { mutateReceipt }); }, true);
   });
@@ -756,5 +786,10 @@ test("R06-B candidate actual trusted finalizer against real Worker/Queue", async
     ["missing effective decision is not a retry fallback", (r: Outputs) => { r.effective_decision = ""; }],
   ] as Array<[string, (receipt: Outputs) => void]>) await t.test(`context rejects ${name}`, async () => {
     await withSession(async (s) => { await candidateScenario(s, allJobs, { rawBranch: "41", unresolvedBranch: "coordination", mutateReceipt }); }, true, { ...decision, targetBranch: "41" });
+  });
+  await t.test("failed preparation with posted reservation cannot use raw-only recovery", async () => {
+    await withSession(async (s) => { await candidateScenario(s, allJobs, { prepareFailure: "failure", mutateReceipt: (r) => {
+      r.reservation_status = "posted"; r.reservation_owner = `github-run-${runId}-1`; r.reservation_comment_id = "41010"; r.reservation_head_sha = sourceSha;
+    } }); }, true);
   });
 });

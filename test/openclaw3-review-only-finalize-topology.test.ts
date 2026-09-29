@@ -19,6 +19,7 @@ const fresh = "steps.fresh-finalize-live.outcome == 'success'";
 const proceed = "steps.fresh-finalize-live.outputs.proceed == 'true'";
 const noRetry = "steps.fresh-finalize-live.outputs.admission_retry != 'true'";
 const posted = `${C}.reservation_status == 'posted'`;
+const prepareSuccess = "needs.event-review-prepare.result == 'success'";
 const modelSuccess = "needs.event-review-apply.result == 'success'";
 const downloaded = "steps.download-finalize-bundle.outcome == 'success'";
 const valid = "steps.validate-finalize-bundle.outcome == 'success'";
@@ -101,7 +102,7 @@ test("R06-B trusted build and fresh live supply bundle expectations before signe
   const j = job(), claim = step(j, "claim-finalize-authority"), live = step(j, "fresh-finalize-live");
   const download = step(j, "download-finalize-bundle"), validate = step(j, "validate-finalize-bundle"), fence = step(j, "fence-finalize-handoff");
   const { build } = sourceBuild(j, claim, download); before(j, build, live); before(j, live, download); before(j, download, validate); before(j, validate, fence);
-  guard(live.if, [current, `${C}.retry_kind == ''`], [first, claimed, buildSuccess]);
+  guard(live.if, [current, `${C}.retry_kind == ''`, prepareSuccess], [first, claimed, buildSuccess]);
   env(live, { CLAIM_DECISION: context("decision"), RAW_CLAIM_DECISION: context("raw_decision"), TARGET_REPO: context("target_repo"), ITEM_NUMBER: context("item_number"), CLAIM_TARGET_BRANCH: context("target_branch"), RESERVATION_HEAD_SHA: context("reservation_head_sha"), GH_TOKEN: expr("secrets.CLAWSWEEPER_TARGET_READ_TOKEN"), CLAWHUB_ENABLED: expr("vars.CLAWSWEEPER_ENABLE_CLAWHUB") });
   const eligible = [current, posted, modelSuccess, fresh, proceed, noRetry];
   guard(download.if, eligible, [first, claimed, buildSuccess, "!cancelled()"]);
