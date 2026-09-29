@@ -59,7 +59,7 @@ function attachDiagnostics(error: unknown, diagnostics: string): never {
   process.stderr.write(`${diagnostics}\n`);
   throw error;
 }
-async function session(pullRequest = false) {
+async function session(pullRequest = false, competingReviewLease = false) {
   const root = mkdtempSync(join(tmpdir(), "oc3-pub-")), bin = join(root, "bin");
   mkdirSync(bin); mkdirSync(join(root, "scripts")); mkdirSync(join(root, "artifacts/event"), { recursive: true });
   cpSync(join(source, "dist"), join(root, "dist"), { recursive: true });
@@ -195,6 +195,21 @@ async function session(pullRequest = false) {
     const { expireReviewStartStatusLease } = await import(pathToFileURL(join(source, "dist/clawsweeper-review-comment-state.js")).href);
     const leaseComment = gh.comments.get(number)!.find((entry) => entry.id === lease.commentId); assert.ok(leaseComment);
     leaseComment.body = expireReviewStartStatusLease(leaseComment.body, "2000-01-01T00:00:00.000Z", number);
+    let blockingReviewLease: { owner: string | null; commentId: number | null; expiresAt: string } | undefined;
+    if (competingReviewLease) {
+      // Same-owner active leases are adoptable by their matching report. Create
+      // a real competing standalone reservation; keep the original report and
+      // bundle tuple intact. This preparation is outside publisher trace counts.
+      const reserved = await command(process.execPath, ["dist/clawsweeper.js", "reserve-review-lease", "--target-repo", repo, "--item-number", String(number), "--review-timeout-ms", "60000"], { GH_TOKEN: "synthetic-only-token", GITHUB_RUN_ID: "51002" }, "reserve competing review lease");
+      assert.equal(reserved.code, 0, reserved.stderr);
+      const acquired = JSON.parse(reserved.stdout.trim()); assert.equal(acquired.status, "posted"); assert.notEqual(acquired.owner, lease.owner);
+      assert.equal(acquired.headSha, pullRequest ? gh.pulls.get(number).head.sha : sourceRevision);
+      assert.equal(itemSourceRevisionSha256ForTest(gh.item, gh.comments.get(number)), sourceRevision);
+      const { freshExactHeadReviewStartLease } = await import(pathToFileURL(join(source, "dist/repair/comment-router-core.js")).href);
+      const active = freshExactHeadReviewStartLease({ comments: gh.comments.get(number), itemNumber: number, headSha: acquired.headSha, trustedAuthors: new Set(["clawsweeper[bot]"]) });
+      assert.ok(active); assert.equal(active.owner, acquired.owner); assert.equal(active.commentId, acquired.commentId);
+      assert.ok(Date.parse(active.expiresAt) > Date.now()); blockingReviewLease = active;
+    }
     const publication = { artifactName: `exact-review-${producerRun}-1`, producerRunId: producerRun, producerRunAttempt: 1, sourceSha, itemKey: key, protocolVersion: 2, leaseRevision: producer.lease_revision, claimGeneration: producer.claim_generation, liveProceeded: true, liveTerminalNoop: false, liveTerminalMissing: false, liveGuardedOpen: false, producerDecision: producer.decision };
     const enqueued = await post("enqueue", { delivery_id: `publisher:${producerRun}:1`, decision: { ...producer.decision, sourceAction: "exact_review_artifact_publish", supersedesInProgress: false, publication } }, true); assert.equal(enqueued.queued, true);
     await post("complete", { ...producerTuple, claim_generation: producer.claim_generation, outcome: "success" });
@@ -204,7 +219,7 @@ async function session(pullRequest = false) {
     const dispatch = { item_key: publicationKey, lease_id: publicationItem.leaseId, lease_revision: publicationItem.leaseRevision, run_id: publisherRun, run_attempt: 1 };
     gh.trace.length = 0; queueTrace.length = 0;
     const state = async () => await storage.get("exact-review-queue");
-    return { root, gh, queue, storage, post, command, state, queueTrace, controls, dispatch, producer, producerTuple, publicationKey, report, reportPath, diagnostics,
+    return { root, gh, queue, storage, post, command, state, queueTrace, controls, dispatch, producer, producerTuple, publicationKey, report, reportPath, diagnostics, blockingReviewLease,
       close: async () => { server.closeAllConnections(); gh.server.closeAllConnections(); await Promise.all([new Promise<void>((done) => server.close(() => done())), new Promise<void>((done) => gh.server.close(() => done()))]); admission.restore(); storage.sql.close(); rmSync(root, { recursive: true, force: true }); },
     };
   } catch (error) {
@@ -322,8 +337,8 @@ function assertCommentOnly(s: Session) {
   assert.ok(s.gh.trace.some((entry) => ["POST", "PATCH"].includes(entry.method || "") && entry.body?.body?.includes("clawsweeper-review-version")), "actual GH comment mutation required");
   s.gh.assertNoForbidden();
 }
-async function withSession(use: (s: Session) => Promise<void>, pullRequest = false) {
-  const s = await session(pullRequest); try { await use(s); } catch (error) { attachDiagnostics(error, s.diagnostics()); } finally { await s.close(); }
+async function withSession(use: (s: Session) => Promise<void>, pullRequest = false, competingReviewLease = false) {
+  const s = await session(pullRequest, competingReviewLease); try { await use(s); } catch (error) { attachDiagnostics(error, s.diagnostics()); } finally { await s.close(); }
 }
 
 // Upstream control is independent of candidate lookups. A control/harness
@@ -337,6 +352,55 @@ test("R06-C fixed upstream actual publication shell writes one restricted issue 
     await runner.finish(published, true);
   });
 });
+
+for (const [label, workflow] of [["fixed upstream control", upstream], ["candidate", candidate]] as const) {
+  test(`R06-C ${label} defers to a real competing review lease and releases its publisher claim`, async () => {
+    await withSession(async (s) => {
+      const runner = scenarioRunner(s, publisher(workflow)); await runner.prepare();
+      const before = (await s.state()).items[s.publicationKey]; assert.equal(before.state, "leased");
+      const commentsBefore = JSON.stringify(s.gh.comments.get(number));
+      assert.ok(s.blockingReviewLease);
+      const published = await runner.execute("publish-event-result"); assert.equal(published.code, 0, published.stderr);
+      assert.equal(published.outputs.completion_kind, "retryable_failure"); assert.equal(published.outputs.reason_code, "review_lease_active");
+      assert.equal(published.outputs.retry_at, s.blockingReviewLease.expiresAt);
+      assert.ok(Date.parse(published.outputs.retry_at) > Date.now());
+      assert.notEqual(published.outputs.remote_tuple_verified, "true");
+      assert.equal(s.gh.mutationCount(), 0); assert.equal(await canonicalRecord(s), null);
+      assert.equal(runner.stages["record-fallback-canonical-lifecycle-receipt"].outcome, "skipped");
+      assert.equal(runner.stages["record-no-router-lifecycle-receipt"].outcome, "skipped");
+      if (workflow === candidate) {
+        // Reuse the actual CLI receipt to check cancellation priority without
+        // changing Queue state. The frozen upstream has an older branch order.
+        const cancelled = await runner.execute("exact-review-publication-result", "cancelled");
+        assert.equal(cancelled.code, 0, cancelled.stderr); assert.equal(cancelled.outputs.outcome, "cancelled");
+        assert.equal(cancelled.outputs.completion_kind, "retryable_failure"); assert.equal(cancelled.outputs.reason_code, "workflow_cancelled");
+        assert.equal(s.queueTrace.some((entry) => entry.path.endsWith("/complete")), false);
+      }
+      const result = await runner.execute("exact-review-publication-result"); assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.outputs.outcome, "success", "Queue accepts review_lease_active deferral as success, never published");
+      assert.equal(result.outputs.completion_kind, "retryable_failure"); assert.equal(result.outputs.reason_code, "review_lease_active");
+      assert.equal(result.outputs.retry_at, published.outputs.retry_at); assert.equal(result.outputs.failure_kind, undefined);
+      const completed = await runner.execute("complete-exact-review-publication"); assert.equal(completed.code, 0, completed.stderr);
+      const completion = s.queueTrace.at(-1)!; assert.equal(completion.path, "/internal/exact-review/complete");
+      assert.equal(completion.status, 200); assert.deepEqual(completion.response, { ok: true, requeued: true });
+      assert.equal(completion.request.item_key, s.publicationKey); assert.equal(completion.request.lease_id, s.dispatch.lease_id);
+      assert.equal(completion.request.lease_revision, s.dispatch.lease_revision);
+      assert.equal(completion.request.claim_generation, Number(runner.stages["publication-context"].outputs.publisher_claim_generation));
+      assert.equal(completion.request.run_id, publisherRun); assert.equal(completion.request.run_attempt, 1);
+      assert.equal(completion.request.outcome, "success"); assert.equal(completion.request.completion_kind, "retryable_failure");
+      assert.equal(completion.request.reason_code, "review_lease_active"); assert.equal(completion.request.retry_at, published.outputs.retry_at);
+      const pending = (await s.state()).items[s.publicationKey]; assert.ok(pending); assert.equal(pending.state, "pending");
+      for (const field of ["leaseId", "leaseRevision", "leaseExpiresAt", "claimedRunId", "claimedRunAttempt", "claimGeneration"]) assert.equal(pending[field], undefined, `${field} must be released`);
+      assert.equal(pending.lastFailureReason, "review_lease_active"); assert.ok(pending.nextAttemptAt >= Date.parse(published.outputs.retry_at));
+      // Preserve existing OSS retry accounting; this is not an exemption from
+      // the publication retry budget and not a completed publication.
+      assert.equal(pending.publicationFailureAttempts, Number(before.publicationFailureAttempts || 0) + 1);
+      assert.equal(s.gh.mutationCount(), 0); assert.equal(s.gh.completedComments().length, 0);
+      assert.equal(JSON.stringify(s.gh.comments.get(number)), commentsBefore); assert.equal(await canonicalRecord(s), null);
+      assert.equal(s.queueTrace.some((entry) => entry.path.endsWith("/publication-batch-results") || entry.path.includes("/lifecycle/")), false);
+    }, false, true);
+  });
+}
 
 test("R06-C candidate actual deferred publisher runtime", async (t) => {
   const steps = publisher(candidate);
