@@ -37,6 +37,26 @@ function parseOutputs(raw: string): Outputs {
   }));
 }
 type QueueTrace = { path: string; request: any; status: number; response: any; sourceResponse?: any; injected?: boolean };
+type CommandDiagnostic = { stage: string; code: number | null; stdout: string; stderr: string; outputs: Outputs };
+// Failure-only diagnostics: these are synthetic runtime facts, never env,
+// request headers, full reports/comments, or private signing material.
+function diagnosticText(value: unknown, limit: number) {
+  const text = String(value ?? "")
+    .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, "[redacted private key]")
+    .replaceAll(secret, "[redacted synthetic secret]")
+    .replace(/synthetic-(?:only|read)-token/g, "[redacted synthetic token]")
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted token]")
+    .replace(/\b(?:Bearer|token)\s+[A-Za-z0-9._~+\/-]+=*/gi, "[redacted authorization]")
+    .replace(/\bsha256=[a-f0-9]{64}\b/gi, "[redacted signature]");
+  return text.length > limit ? `[tail; ${text.length - limit} chars omitted]\n${text.slice(-limit)}` : text;
+}
+function diagnosticFields(value: any, keys: string[]) {
+  return Object.fromEntries(keys.filter((key) => ["string", "number", "boolean"].includes(typeof value?.[key])).map((key) => [key, diagnosticText(value[key], 180)]));
+}
+function attachDiagnostics(error: unknown, diagnostics: string): never {
+  if (error instanceof Error) { error.message += `\n${diagnostics}`; throw error; }
+  throw new Error(`${diagnosticText(error, 500)}\n${diagnostics}`);
+}
 async function session(pullRequest = false) {
   const root = mkdtempSync(join(tmpdir(), "oc3-pub-")), bin = join(root, "bin");
   mkdirSync(bin); mkdirSync(join(root, "scripts")); mkdirSync(join(root, "artifacts/event"), { recursive: true });
@@ -63,6 +83,21 @@ async function session(pullRequest = false) {
   const workerEnv = { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue), CLAWSWEEPER_WEBHOOK_SECRET: secret, hostedTargetPredicate: () => true, hostedPublicTargetProbe: async () => "public" };
   const queueTrace: QueueTrace[] = [], errors: string[] = [];
   const controls = { canonicalFailure: false, corruptReceipt: "" as "" | "canonical-receipt" | "router-receipt" };
+  const commands: CommandDiagnostic[] = [];
+  function diagnostics() {
+    const outputKeys = ["claimed", "remote_tuple_verified", "routable_sync_verified", "outcome", "completion_kind", "reason_code", "error_fingerprint", "retry_at", "canonical_outcome", "receipt_outcome"];
+    const responseKeys = ["ok", "claimed", "accepted", "outcome", "reason", "error", "message", "completion_kind", "reason_code", "claim_generation", "lease_revision"];
+    const trace = {
+      gh: gh.trace.slice(-10).map(({ method, path, readOnlyGraphql }) => ({ method, path: diagnosticText(path, 180), ...(readOnlyGraphql ? { readOnlyGraphql } : {}) })),
+      queue: queueTrace.slice(-8).map((entry) => ({ path: diagnosticText(entry.path, 180), status: entry.status, injected: entry.injected || false,
+        request: diagnosticFields(entry.request, ["item_key", "run_id", "run_attempt", "lease_revision", "claim_generation", "outcome", "completion_kind", "reason_code"]),
+        response: diagnosticFields(entry.response, responseKeys), sourceResponse: diagnosticFields(entry.sourceResponse, responseKeys) })),
+      commands: commands.slice(-2).map((entry) => ({ stage: diagnosticText(entry.stage, 120), code: entry.code,
+        stdout: diagnosticText(entry.stdout, 2200), stderr: diagnosticText(entry.stderr, 1000), outputs: diagnosticFields(entry.outputs, outputKeys) })),
+    };
+    const body = JSON.stringify(trace, null, 2);
+    return `R06-C synthetic runtime diagnostics (bounded):\n${body.length > 16000 ? body.slice(0, 16000) + "\n[diagnostics truncated]" : body}`;
+  }
   async function post(route: string, body: any, signed = false) {
     const request = signed ? signedStateAppendRequest(`/internal/exact-review/${route}`, body, secret) : new Request(`https://manual-queue.invalid/internal/exact-review/${route}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const response = await worker.fetch(request, workerEnv); const value = await response.json() as any;
@@ -111,7 +146,7 @@ async function session(pullRequest = false) {
       CLAWSWEEPER_ACTION_LEDGER_DISABLED: "1", CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1", CI: "true",
       COREPACK_HOME: process.env.COREPACK_HOME || join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "node/corepack"), COREPACK_ENABLE_NETWORK: "0", COREPACK_ENV_FILE: "0", COREPACK_ENABLE_DOWNLOAD_PROMPT: "0", COREPACK_DEFAULT_TO_LATEST: "0",
     };
-    async function command(command: string, args: string[], env: Outputs = {}) {
+    async function command(command: string, args: string[], env: Outputs = {}, stage = "bootstrap") {
       const output = join(root, `outputs-${++sequence}`); writeFileSync(output, "");
       const child = spawn(command, args, { cwd: root, detached: true, env: { ...runtime, GITHUB_OUTPUT: output, ...env }, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "", stderr = "", expired = false;
@@ -120,9 +155,12 @@ async function session(pullRequest = false) {
       child.stderr.on("data", (v) => { stderr += v; if (stderr.length > 4 * 1024 * 1024) kill(); });
       const timer = setTimeout(() => { expired = true; kill(); }, 45_000);
       const code = await new Promise<number | null>((accept, reject) => { child.once("error", reject); child.once("close", accept); }).finally(() => { clearTimeout(timer); kill(); });
+      const diagnostic: CommandDiagnostic = { stage, code, stdout, stderr, outputs: {} };
+      commands.push(diagnostic); if (commands.length > 2) commands.shift();
       assert.equal(expired, false, "HARNESS_ERROR: timeout is not product rejection"); assert.notEqual(code, null, "HARNESS_ERROR: killed child");
       assert.deepEqual(errors, []); gh.assertNoForbidden();
-      return { code, stdout, stderr, outputs: parseOutputs(readFileSync(output, "utf8")) };
+      const outputs = parseOutputs(readFileSync(output, "utf8")); diagnostic.outputs = outputs;
+      return { code, stdout, stderr, outputs };
     }
     const requested = { targetRepo: repo, targetBranch: "main", itemNumber: number, itemKind: pullRequest ? "pull_request" : "issue", sourceEvent: pullRequest ? "pull_request" : "issues", sourceAction: "manual_explicit_review", publicationPolicy: "record_comment_only", supersedesInProgress: false, ...(pullRequest ? { sourceHeadSha: gh.pulls.get(number).head.sha } : {}) };
     await post("enqueue", { delivery_id: "r06c-producer-admission", decision: requested }, true);
@@ -162,11 +200,11 @@ async function session(pullRequest = false) {
     const dispatch = { item_key: publicationKey, lease_id: publicationItem.leaseId, lease_revision: publicationItem.leaseRevision, run_id: publisherRun, run_attempt: 1 };
     gh.trace.length = 0; queueTrace.length = 0;
     const state = async () => await storage.get("exact-review-queue");
-    return { root, gh, queue, storage, post, command, state, queueTrace, controls, dispatch, producer, producerTuple, publicationKey, report, reportPath,
+    return { root, gh, queue, storage, post, command, state, queueTrace, controls, dispatch, producer, producerTuple, publicationKey, report, reportPath, diagnostics,
       close: async () => { server.closeAllConnections(); gh.server.closeAllConnections(); await Promise.all([new Promise<void>((done) => server.close(() => done())), new Promise<void>((done) => gh.server.close(() => done()))]); admission.restore(); storage.sql.close(); rmSync(root, { recursive: true, force: true }); },
     };
   } catch (error) {
-    server.closeAllConnections(); gh.server.closeAllConnections(); server.close(); gh.server.close(); admission.restore(); storage.sql.close(); rmSync(root, { recursive: true, force: true }); throw error;
+    server.closeAllConnections(); gh.server.closeAllConnections(); server.close(); gh.server.close(); admission.restore(); storage.sql.close(); rmSync(root, { recursive: true, force: true }); attachDiagnostics(error, diagnostics());
   }
 }
 type Session = Awaited<ReturnType<typeof session>>;
@@ -212,7 +250,7 @@ function scenarioRunner(s: Session, steps: Step[]) {
   async function run(step: Step, jobStatus = "success") {
     assert.ok(step.run);
     const env = Object.fromEntries(Object.entries(step.env || {}).map(([name, value]) => [name, render(value, jobStatus)]));
-    const result = await s.command("/bin/bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", render(step.run, jobStatus)], env);
+    const result = await s.command("/bin/bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", render(step.run, jobStatus)], env, step.id || step.name || "workflow step");
     if (step.id) stages[step.id] = { outputs: result.outputs, outcome: result.code === 0 ? "success" : "failure" };
     return result;
   }
@@ -281,7 +319,7 @@ function assertCommentOnly(s: Session) {
   s.gh.assertNoForbidden();
 }
 async function withSession(use: (s: Session) => Promise<void>, pullRequest = false) {
-  const s = await session(pullRequest); try { await use(s); } finally { await s.close(); }
+  const s = await session(pullRequest); try { await use(s); } catch (error) { attachDiagnostics(error, s.diagnostics()); } finally { await s.close(); }
 }
 
 // Upstream control is independent of candidate lookups. A control/harness
