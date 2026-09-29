@@ -12,7 +12,7 @@ export function publicationGithubFixture(number: number, pullRequest: boolean) {
   const item: any = { number, title: "Bounded synthetic review", body: "Existing behavior bug.", html_url: `https://github.com/${repo}/issues/${number}`, state: "open", locked: false, user: { login: "fixture-author" }, author_association: "CONTRIBUTOR", labels: [{ name: "bug" }], created_at: "2026-07-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z", comments: 0, pull_request: pullRequest ? { url: `https://api.github.com/repos/${repo}/pulls/${number}` } : null };
   const items = new Map<number, any>([[number, item]]);
   const comments = new Map<number, any[]>([[number, []]]);
-  const pulls = new Map<number, any>(pullRequest ? [[number, { ...item, draft: false, merged: false, merged_at: null, mergeable: true, mergeable_state: "clean", head: { sha: "d".repeat(40), ref: `fixture-${number}`, repo: { full_name: repo } }, base: { sha: "b".repeat(40), ref: "main", repo: { full_name: repo } }]] : []);
+  const pulls = new Map<number, any>(pullRequest ? [[number, { ...item, draft: false, merged: false, merged_at: null, mergeable: true, mergeable_state: "clean", head: { sha: "d".repeat(40), ref: `fixture-${number}`, repo: { full_name: repo } }, base: { sha: "b".repeat(40), ref: "main", repo: { full_name: repo } } }]] : []);
   let nextComment = 100;
   async function handle(req: IncomingMessage, res: ServerResponse) {
     try {
