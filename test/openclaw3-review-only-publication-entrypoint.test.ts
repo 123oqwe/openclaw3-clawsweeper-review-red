@@ -60,7 +60,7 @@ function attachDiagnostics(error: unknown, diagnostics: string): never {
   process.stderr.write(`${diagnostics}\n`);
   throw error;
 }
-async function session(pullRequest = false, competingReviewLease = false, direct = false) {
+async function session(pullRequest = false, competingReviewLease = false, direct = false, commandContext = false) {
   const root = mkdtempSync(join(tmpdir(), "oc3-pub-")), bin = join(root, "bin");
   mkdirSync(bin); mkdirSync(join(root, "scripts")); mkdirSync(join(root, "artifacts/event"), { recursive: true });
   cpSync(join(source, "dist"), join(root, "dist"), { recursive: true });
@@ -172,7 +172,16 @@ async function session(pullRequest = false, competingReviewLease = false, direct
       const outputs = parseOutputs(readFileSync(output, "utf8")); diagnostic.outputs = outputs;
       return { code, stdout, stderr, outputs };
     }
-    const requested = { targetRepo: repo, targetBranch: "main", itemNumber: number, itemKind: pullRequest ? "pull_request" : "issue", sourceEvent: pullRequest ? "pull_request" : "issues", sourceAction: "manual_explicit_review", publicationPolicy: "record_comment_only", supersedesInProgress: false, ...(pullRequest ? { sourceHeadSha: gh.pulls.get(number).head.sha } : {}) };
+    let commandStatus: { commandStatusMarker: string; statusCommentId: number } | undefined;
+    if (commandContext) {
+      const marker = `<!-- clawsweeper-command-status:${number}:re_review:r06d -->`;
+      const createdStatus = await command("gh", ["api", `repos/${repo}/issues/${number}/comments`, "--method", "POST", "-f", `body=Review requested.\n\n${marker}`], { GH_TOKEN: "synthetic-only-token" }, "create real command status address");
+      assert.equal(createdStatus.code, 0, createdStatus.stderr);
+      const status = JSON.parse(createdStatus.stdout); assert.ok(Number.isSafeInteger(status.id) && status.id > 0);
+      assert.equal(status.user.login, "clawsweeper[bot]"); assert.ok(status.body.includes(marker));
+      commandStatus = { commandStatusMarker: marker, statusCommentId: status.id };
+    }
+    const requested = { targetRepo: repo, targetBranch: "main", itemNumber: number, itemKind: pullRequest ? "pull_request" : "issue", sourceEvent: pullRequest ? "pull_request" : "issues", sourceAction: "manual_explicit_review", publicationPolicy: "record_comment_only", supersedesInProgress: false, ...(pullRequest ? { sourceHeadSha: gh.pulls.get(number).head.sha } : {}), ...commandStatus };
     await post("enqueue", { delivery_id: "r06c-producer-admission", decision: requested }, true);
     await queue.alarm();
     const producerItem = (await storage.get("exact-review-queue")).items[key]; assert.equal(producerItem.state, "dispatching");
@@ -371,8 +380,8 @@ function assertCommentOnly(s: Session) {
   assert.ok(s.gh.trace.some((entry) => ["POST", "PATCH"].includes(entry.method || "") && entry.body?.body?.includes("clawsweeper-review-version")), "actual GH comment mutation required");
   s.gh.assertNoForbidden();
 }
-async function withSession(use: (s: Session) => Promise<void>, pullRequest = false, competingReviewLease = false, direct = false) {
-  const s = await session(pullRequest, competingReviewLease, direct); try { await use(s); } catch (error) { attachDiagnostics(error, s.diagnostics()); } finally { await s.close(); }
+async function withSession(use: (s: Session) => Promise<void>, pullRequest = false, competingReviewLease = false, direct = false, commandContext = false) {
+  const s = await session(pullRequest, competingReviewLease, direct, commandContext); try { await use(s); } catch (error) { attachDiagnostics(error, s.diagnostics()); } finally { await s.close(); }
 }
 
 // Upstream control is independent of candidate lookups. A control/harness
@@ -854,4 +863,128 @@ for (const [label, workflow] of [["fixed upstream control", upstream], ["candida
     const record = await canonicalRecord(s); assert.ok(record); assert.match(record.content, /^publication_policy: record_comment_only$/m);
     const finished = await third.finish(recovered, true); assert.equal(finished.completion.request.run_attempt, 3);
   });
+});
+
+// Isolate the shared Queue retry-closure contract from candidate workflow IDs.
+// All stored claims/retries/receipts are obtained through real Worker APIs;
+// canonical data, when present, was produced by the session's actual two CLIs.
+async function ownedRetryClosure(s: Session, t: TestContext) {
+  if (!s.direct) await scenarioRunner(s, publisher(upstream)).claim();
+  const original = (await s.state()).items[s.publicationKey]; assert.equal(original.state, "leased");
+  const previousTuple = { item_key: s.publicationKey, lease_id: original.leaseId, lease_revision: original.leaseRevision, claim_generation: original.claimGeneration, run_id: original.claimedRunId, run_attempt: original.claimedRunAttempt };
+  const failed = await s.post("complete", { ...previousTuple, outcome: "failure", completion_kind: "retryable_failure", reason_code: "state_contention", lifecycle_terminal_disposition: "requeue" });
+  assert.deepEqual(failed, { ok: true, requeued: true });
+  const projection = () => new ExactReviewLifecycleProjectionStore(s.storage).read(key, s.publicationKey, previousTuple.lease_revision)!;
+  assert.equal(lifecycleState(projection()), "requeue");
+  const pending = (await s.state()).items[s.publicationKey]; assert.equal(pending.state, "pending"); assert.equal(pending.leaseId, undefined);
+  const clock = t.mock.method(Date, "now", () => Math.max(pending.nextAttemptAt, pending.updatedAt) + 1);
+  try { await s.queue.alarm(); } finally { clock.mock.restore(); }
+  const dispatched = (await s.state()).items[s.publicationKey]; assert.equal(dispatched.state, "dispatching");
+  assert.notEqual(dispatched.leaseId, previousTuple.lease_id); assert.equal(dispatched.leaseRevision, previousTuple.lease_revision);
+  Object.assign(s.dispatch, { lease_id: dispatched.leaseId, lease_revision: dispatched.leaseRevision });
+  const owner = { runId: "71001", runAttempt: 1 }, runner = scenarioRunner(s, publisher(upstream), owner);
+  const claim = await runner.claim();
+  const tuple = { item_key: claim.publisher_item_key, lease_id: claim.publisher_lease_id, lease_revision: Number(claim.publisher_lease_revision), claim_generation: Number(claim.publisher_claim_generation), run_id: owner.runId, run_attempt: owner.runAttempt };
+  assert.equal((await s.state()).items[s.publicationKey].revision, tuple.lease_revision);
+  assert.equal(lifecycleState(projection()), "requeue");
+  const canonical = await canonicalRecord(s), comments = JSON.stringify(s.gh.comments.get(number));
+  assert.equal(Boolean(canonical), s.direct);
+  if (s.direct) assert.ok(projection().canonicalReceipts.some((receipt) => ["accepted", "deduped"].includes(receipt.outcome)));
+  return { runner, tuple, projection, canonical, comments };
+}
+async function replayRetryReceipt(s: Session, retry: Awaited<ReturnType<typeof ownedRetryClosure>>) {
+  assert.equal(s.direct, true);
+  const replayed = await retry.runner.execute("replay-direct-lifecycle"); assert.equal(replayed.code, 0, replayed.stderr);
+  assert.equal(replayed.outputs.completion_kind, "published"); assert.equal(replayed.outputs.reason_code, "publication_applied");
+  const receipt = retry.projection().routerReceipt; assert.ok(receipt);
+  assert.equal(receipt.outcome, "not_required"); assert.equal(retry.projection().routerReceipts.find((entry) => entry.receiptId === receipt.receiptId)?.operationComplete, true);
+  // Even a real confirmed receipt must not override a committed retry before
+  // the currently owned completion has checked its tuple and transition.
+  assert.equal(lifecycleState(retry.projection()), "requeue");
+  assert.deepEqual(await canonicalRecord(s), retry.canonical); assert.equal(JSON.stringify(s.gh.comments.get(number)), retry.comments);
+}
+
+test("R06-D Queue closes a same-revision retry only at owned published completion, not duplicate receipts", async (t) => {
+  await withSession(async (s) => {
+    const retry = await ownedRetryClosure(s, t);
+    await replayRetryReceipt(s, retry); await replayRetryReceipt(s, retry);
+    assert.equal((await s.state()).items[s.publicationKey].state, "leased");
+    const completed = await s.post("complete", { ...retry.tuple, outcome: "success", completion_kind: "published", reason_code: "publication_applied" });
+    assert.deepEqual(completed, { ok: true, requeued: false }); assert.equal((await s.state()).items[s.publicationKey], undefined);
+    assert.equal(lifecycleState(retry.projection()), "completed");
+    assert.ok(retry.projection().canonicalReceipts.some((receipt) => ["accepted", "deduped"].includes(receipt.outcome)));
+    assert.deepEqual(await canonicalRecord(s), retry.canonical); assert.equal(JSON.stringify(s.gh.comments.get(number)), retry.comments);
+  }, false, false, true);
+});
+
+test("R06-D Queue rejects a stale completion before it can close a durable retry", async (t) => {
+  await withSession(async (s) => {
+    const retry = await ownedRetryClosure(s, t); await replayRetryReceipt(s, retry);
+    const successor = await s.post("claim", { ...retry.tuple, run_attempt: 2 }); assert.equal(successor.claimed, true);
+    assert.ok(successor.claim_generation > retry.tuple.claim_generation);
+    const before = JSON.stringify(await s.state()), projectionBefore = JSON.stringify(retry.projection());
+    await assert.rejects(s.post("complete", { ...retry.tuple, outcome: "success", completion_kind: "published", reason_code: "publication_applied" }), /complete: 409/);
+    assert.equal(JSON.stringify(await s.state()), before); assert.equal(JSON.stringify(retry.projection()), projectionBefore);
+    assert.equal(lifecycleState(retry.projection()), "requeue");
+    assert.deepEqual(await canonicalRecord(s), retry.canonical); assert.equal(JSON.stringify(s.gh.comments.get(number)), retry.comments);
+  }, false, false, true);
+});
+
+test("R06-D Queue cannot promote a retry without a confirmed router receipt", async (t) => {
+  await withSession(async (s) => {
+    const retry = await ownedRetryClosure(s, t); assert.ok(retry.canonical); assert.equal(retry.projection().routerReceipt, null);
+    // A syntactically valid owner's claim of publication is insufficient to
+    // close lifecycle without durable evidence. No successful CLI is invented.
+    const completed = await s.post("complete", { ...retry.tuple, outcome: "success", completion_kind: "published", reason_code: "publication_applied" });
+    assert.deepEqual(completed, { ok: true, requeued: false });
+    assert.equal(lifecycleState(retry.projection()), "requeue"); assert.equal(retry.projection().routerReceipt, null);
+    assert.deepEqual(await canonicalRecord(s), retry.canonical); assert.equal(JSON.stringify(s.gh.comments.get(number)), retry.comments);
+  }, false, false, true);
+});
+
+test("R06-D Queue preserves an explicitly requested retry despite confirmed publication receipts", async (t) => {
+  await withSession(async (s) => {
+    const retry = await ownedRetryClosure(s, t); await replayRetryReceipt(s, retry);
+    const completed = await s.post("complete", { ...retry.tuple, outcome: "success", completion_kind: "published", reason_code: "publication_applied", lifecycle_terminal_disposition: "requeue" });
+    assert.deepEqual(completed, { ok: true, requeued: false }); assert.equal(lifecycleState(retry.projection()), "requeue");
+    assert.deepEqual(await canonicalRecord(s), retry.canonical); assert.equal(JSON.stringify(s.gh.comments.get(number)), retry.comments);
+  }, false, false, true);
+});
+
+test("R06-D Queue cannot promote a retry without an accepted or deduped canonical receipt", async (t) => {
+  await withSession(async (s) => {
+    const retry = await ownedRetryClosure(s, t); assert.equal(retry.canonical, null); assert.deepEqual(retry.projection().canonicalReceipts, []);
+    // A real signed router receipt is independent of canonical acceptance; this
+    // negative case never fabricates a canonical receipt or a published CLI.
+    const received = await s.post("lifecycle/router-receipt", { canonical_target_key: key, fence_key: s.publicationKey, revision: retry.tuple.lease_revision, outcome: "not_required", receipt_id: "r06d-missing-canonical-router" }, true);
+    assert.equal(received.ok, true); assert.equal(retry.projection().routerReceipts.find((entry) => entry.receiptId === "r06d-missing-canonical-router")?.operationComplete, true); assert.equal(lifecycleState(retry.projection()), "requeue");
+    const completed = await s.post("complete", { ...retry.tuple, outcome: "success", completion_kind: "published", reason_code: "publication_applied" });
+    assert.deepEqual(completed, { ok: true, requeued: false }); assert.equal(lifecycleState(retry.projection()), "requeue");
+    assert.deepEqual(retry.projection().canonicalReceipts, []); assert.equal(await canonicalRecord(s), null);
+    assert.equal(JSON.stringify(s.gh.comments.get(number)), retry.comments);
+  });
+});
+
+test("R06-D Queue closes an owned command retry and atomically schedules its acknowledgement finalizer", async (t) => {
+  await withSession(async (s) => {
+    const retry = await ownedRetryClosure(s, t);
+    const marker = s.producer.decision.commandStatusMarker, statusCommentId = s.producer.decision.statusCommentId;
+    assert.ok(marker && Number.isSafeInteger(statusCommentId));
+    assert.equal(retry.projection().admission.commandOriginated, true);
+    assert.equal(retry.projection().admission.statusMarker, marker); assert.equal(retry.projection().admission.statusCommentId, statusCommentId);
+    assert.equal(retry.projection().acknowledgement.required, true); assert.equal(retry.projection().acknowledgement.observed, null);
+    await replayRetryReceipt(s, retry);
+    const driverKey = `terminal-finalization:${s.publicationKey}:${retry.tuple.lease_revision}`;
+    assert.equal((await s.state()).items[driverKey], undefined, "receipt alone cannot schedule a finalizer for an outstanding retry");
+    const completed = await s.post("complete", { ...retry.tuple, outcome: "success", completion_kind: "published", reason_code: "publication_applied" });
+    assert.deepEqual(completed, { ok: true, requeued: false, terminal_finalization: true });
+    const state = await s.state(); assert.equal(state.items[s.publicationKey], undefined);
+    const driver = state.items[driverKey]; assert.ok(driver); assert.equal(driver.state, "pending"); assert.equal(driver.leaseId, undefined);
+    assert.equal(driver.decision.publication, undefined); assert.equal(driver.decision.commandStatusMarker, marker); assert.equal(driver.decision.statusCommentId, statusCommentId);
+    assert.equal(driver.terminalFinalization.disposition, "review_completed_routed");
+    assert.deepEqual(driver.terminalFinalization.projection, { canonicalTargetKey: key, fenceKey: s.publicationKey, revision: retry.tuple.lease_revision });
+    assert.equal(retry.projection().terminalDisposition?.kind, "review_completed_routed");
+    assert.equal(lifecycleState(retry.projection()), "acknowledgement_pending"); assert.equal(retry.projection().acknowledgement.observed, null);
+    assert.deepEqual(await canonicalRecord(s), retry.canonical); assert.equal(JSON.stringify(s.gh.comments.get(number)), retry.comments);
+  }, false, false, true, true);
 });

@@ -93,3 +93,15 @@ jobs:
           test/openclaw3-review-only-publication-topology.test.ts
           test/openclaw3-review-only-publication-entrypoint.test.ts
           test/openclaw3-review-only-recovery-topology.test.ts
+      - name: Regress existing lifecycle receipt ordering and command finalization
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        run: >-
+          node --test
+          --test-name-pattern '^(router receipt repair preserves|lifecycle (router-receipt|terminal-disposition) replay|non-batch publication completions record durable terminal outcomes without inferring acceptance|direct lifecycle (requeue|router completion)|terminal disposition materializes a direct acknowledgement driver after lease expiry|direct command publication retains its terminal acknowledgement driver after durable handoff)'
+          test/dashboard-worker-publication-lifecycle.test.ts
+      - name: Regress existing Queue claim completion ownership fences
+        if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
+        run: >-
+          node --test
+          --test-name-pattern '^exact-review (claim and completion reject forged or incomplete lease tuples|completion rejects stale owners and is race-idempotent)$'
+          test/dashboard-worker-queue-runtime.test.ts
