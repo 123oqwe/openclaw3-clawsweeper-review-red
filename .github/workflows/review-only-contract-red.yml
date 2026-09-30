@@ -86,9 +86,10 @@ jobs:
           test/openclaw3-review-only-finalize-topology.test.ts
           test/openclaw3-review-only-finalize-entrypoint.test.ts
           test/openclaw3-review-only-finalize-live-cleanup.test.ts
-      - name: Run planner-owned ordinary publisher and durable completion
+      - name: Run planner-owned ordinary publisher and direct recovery
         if: ${{ !cancelled() && steps.build-runtime.outcome == 'success' }}
         run: >-
           node --test
           test/openclaw3-review-only-publication-topology.test.ts
           test/openclaw3-review-only-publication-entrypoint.test.ts
+          test/openclaw3-review-only-recovery-topology.test.ts
