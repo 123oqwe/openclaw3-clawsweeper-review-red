@@ -3169,6 +3169,11 @@ export class ExactReviewQueue {
         return json({ error: "lease_attempt_not_claimed" }, 409);
       }
 
+      const currentOwnerCompletesSameRevision =
+        tupleCompletion &&
+        runAttempt !== null &&
+        item.claimedRunAttempt === runAttempt &&
+        item.revision === leaseRevision;
       // The workflow reports success only after every primary review mutation has settled.
       // Complete that revision now so a later auxiliary-step failure cannot make the
       // workflow_run reconciler requeue review work that already succeeded.
@@ -3260,6 +3265,19 @@ export class ExactReviewQueue {
               refreshed: false,
               deadLetter: undefined,
             };
+      // Only this fully fenced v2 owner can close a same-revision retry. This
+      // capability is internal, never a request field or a receipt-side effect.
+      const allowOwnedRetryClosure =
+        currentOwnerCompletesSameRevision &&
+        outcome === "success" &&
+        publicationCompletion?.kind === "published" &&
+        publicationCompletion.reasonCode === "publication_applied" &&
+        !requeueLatest &&
+        !directLifecycleRequeue &&
+        !completionResult.requeued &&
+        !completionResult.parked &&
+        !completionResult.deadLetter &&
+        (lifecycleTerminal === undefined || lifecycleTerminal === "review_completed_routed");
       // A newer command revision may retain the current queue slot while this
       // direct receipt completes. Its queue requeue is not a requeue fact for
       // the older fenced lifecycle projection.
@@ -3289,6 +3307,7 @@ export class ExactReviewQueue {
         parked: Boolean(completionResult.parked),
         deadLetter: Boolean(completionResult.deadLetter),
         lifecycleTerminal,
+        allowOwnedRetryClosure,
       });
       const terminalFinalization =
         publicationCompletionOwnedByLease &&
@@ -3398,6 +3417,7 @@ export class ExactReviewQueue {
           parked: Boolean(completionResult.parked),
           deadLetter: Boolean(completionResult.deadLetter),
           lifecycleTerminal,
+          allowOwnedRetryClosure,
           now,
         });
         if (publicationItem && publicationCompletion) {
@@ -9730,6 +9750,7 @@ export class ExactReviewQueue {
     parked,
     deadLetter,
     lifecycleTerminal,
+    allowOwnedRetryClosure = false,
     now,
   }) {
     const identity = {
@@ -9754,6 +9775,7 @@ export class ExactReviewQueue {
       parked,
       deadLetter,
       lifecycleTerminal,
+      allowOwnedRetryClosure,
     });
     if (disposition) {
       const terminal = this.lifecycleProjectionStore.recordTerminalDisposition({
@@ -14953,6 +14975,7 @@ function exactReviewLifecycleCompletionDisposition({
   parked,
   deadLetter,
   lifecycleTerminal,
+  allowOwnedRetryClosure = false,
 }: {
   projection: ExactReviewLifecycleProjection | null;
   outcome: ExactReviewCompletionOutcome;
@@ -14961,12 +14984,29 @@ function exactReviewLifecycleCompletionDisposition({
   parked: boolean;
   deadLetter: boolean;
   lifecycleTerminal?: LifecycleTerminalDisposition;
+  allowOwnedRetryClosure?: boolean;
 }): LifecycleTerminalDisposition | null {
   let disposition: LifecycleTerminalDisposition | null;
   if (deadLetter) disposition = "dead_letter";
   else if (requeued || parked) disposition = "requeue";
   else if (lifecycleTerminal) disposition = lifecycleTerminal;
-  else if (publicationCompletion?.kind === "superseded") {
+  else if (
+    allowOwnedRetryClosure &&
+    projection?.terminalDisposition?.kind === "requeue" &&
+    projection.canonicalReceipts.some((receipt) =>
+      ["accepted", "deduped"].includes(receipt.outcome),
+    ) &&
+    projection.routerReceipt &&
+    ["durable", "not_required"].includes(projection.routerReceipt.outcome) &&
+    projection.routerReceipts.some(
+      (receipt) =>
+        receipt.receiptId === projection.routerReceipt?.receiptId &&
+        receipt.outcome === projection.routerReceipt?.outcome &&
+        receipt.operationComplete === true,
+    )
+  ) {
+    disposition = "review_completed_routed";
+  } else if (publicationCompletion?.kind === "superseded") {
     disposition =
       publicationCompletion.reasonCode === "remote_closed" ? "target_closed" : "superseded";
   } else if (publicationCompletion?.kind === "permanent_failure") disposition = "failure";
