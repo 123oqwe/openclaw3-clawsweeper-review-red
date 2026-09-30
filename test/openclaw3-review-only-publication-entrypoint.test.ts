@@ -572,13 +572,20 @@ async function assertRecoveryDidNotRepublish(s: Session, checkpoint: Awaited<Ret
 async function completeRecovery(s: Session, checkpoint: Awaited<ReturnType<typeof beginRecovery>>, workflow: string, owner = directOwner) {
   const ids = recoveryIds(workflow), runner = checkpoint.runner;
   const result = await runner.execute(ids.result); assert.equal(result.code, 0, result.stderr);
-  assert.equal(result.outputs.outcome, "success"); assert.equal(result.outputs.completion_kind, "published"); assert.equal(result.outputs.reason_code, "publication_applied");
+  // Fixed upstream's final classification block overwrites a valid direct
+  // replay with superseded/live_terminal because ordinary publish was skipped.
+  // Characterize that source defect; it is not the candidate's required result.
+  const classification = workflow === upstream
+    ? { kind: "superseded", reason: "live_terminal" }
+    : { kind: "published", reason: "publication_applied" };
+  assert.equal(result.outputs.outcome, "success"); assert.equal(result.outputs.completion_kind, classification.kind); assert.equal(result.outputs.reason_code, classification.reason);
   const completed = await runner.execute(ids.complete); assert.equal(completed.code, 0, completed.stderr);
   const trace = s.queueTrace.at(-1)!; assert.equal(trace.path, "/internal/exact-review/complete");
   assert.equal(trace.status, 200); assert.equal(trace.response.ok, true); assert.equal(trace.response.requeued, false);
   assert.equal(trace.request.item_key, s.publicationKey); assert.equal(trace.request.lease_id, s.dispatch.lease_id);
   assert.equal(trace.request.lease_revision, s.dispatch.lease_revision); assert.equal(trace.request.claim_generation, Number(runner.stages["publication-context"].outputs.publisher_claim_generation));
   assert.equal(trace.request.run_id, owner.runId); assert.equal(trace.request.run_attempt, owner.runAttempt);
+  assert.equal(trace.request.outcome, "success"); assert.equal(trace.request.completion_kind, classification.kind); assert.equal(trace.request.reason_code, classification.reason);
   assert.equal((await s.state()).items[s.publicationKey], undefined);
   const lifecycle = new ExactReviewLifecycleProjectionStore(s.storage).read(key, s.publicationKey, s.dispatch.lease_revision);
   assert.ok(lifecycle); assert.equal(lifecycle.routerReceipt?.outcome, "not_required"); assert.equal(lifecycleState(lifecycle), "completed");
@@ -596,7 +603,7 @@ async function dispatchPendingRecovery(s: Session, t: TestContext) {
   Object.assign(s.dispatch, { item_key: key, lease_id: dispatched.leaseId, lease_revision: dispatched.leaseRevision });
 }
 
-for (const [label, workflow] of [["fixed upstream control", upstream], ["candidate", candidate]] as const) {
+for (const [label, workflow] of [["fixed upstream protocol control (classification defect characterized)", upstream], ["candidate", candidate]] as const) {
   test(`R06-D ${label} recovers actual direct PR canonical acceptance in a later run attempt`, async () => {
     await withSession(async (s) => {
       const checkpoint = await beginRecovery(s, workflow);
@@ -619,7 +626,7 @@ for (const [label, workflow] of [["fixed upstream control", upstream], ["candida
   });
 }
 
-for (const [label, workflow] of [["fixed upstream control", upstream], ["candidate", candidate]] as const) test(`R06-D ${label} recovers a direct issue publication in a new run after real signed reconciliation and dispatch`, async (t) => {
+for (const [label, workflow] of [["fixed upstream protocol control (classification defect characterized)", upstream], ["candidate", candidate]] as const) test(`R06-D ${label} recovers a direct issue publication in a new run after real signed reconciliation and dispatch`, async (t) => {
   await withSession(async (s) => {
     const reconciled = await s.post("reconcile", { terminal_runs: [{ run_id: producerRun, run_attempt: 1, claimed_run_attempt: 1, claim_generation: s.producer.claim_generation, outcome: "failure" }] }, true);
     assert.deepEqual(reconciled, { ok: true, reconciled: 1, requeued: 1, completed: 0 });
@@ -774,7 +781,7 @@ for (const fault of ["new-owner", "unconfirmed-200"] as const) test(`R06-D candi
   }, false, false, true);
 });
 
-for (const [label, workflow] of [["fixed upstream control", upstream], ["candidate", candidate]] as const) test(`R06-D ${label} readback unavailable cannot publish; a later attempt recovers the same comment`, async () => {
+for (const [label, workflow] of [["fixed upstream control", upstream], ["candidate", candidate]] as const) test(`R06-D ${label} readback unavailable defers behind the interrupted owner's lease and recovers after explicit owner cleanup`, async (t) => {
   await withSession(async (s) => {
     const first = scenarioRunner(s, publisher(workflow)); await first.prepare();
     s.gh.controls.lostAcknowledgement = true; s.gh.recoveryControls.readbackUnavailable = true;
@@ -789,8 +796,62 @@ for (const [label, workflow] of [["fixed upstream control", upstream], ["candida
     s.gh.recoveryControls.readbackUnavailable = false;
     const second = scenarioRunner(s, publisher(workflow), { runId: publisherRun, runAttempt: 2 });
     const claim = await second.prepare(); assert.ok(Number(claim.publisher_claim_generation) > Number(first.stages["publication-context"].outputs.publisher_claim_generation));
-    const recovered = await second.execute("publish-event-result"); assert.equal(recovered.code, 0, recovered.stderr);
+    const deferred = await second.execute("publish-event-result"); assert.equal(deferred.code, 0, deferred.stderr);
+    assert.equal(deferred.outputs.completion_kind, "retryable_failure"); assert.equal(deferred.outputs.reason_code, "review_lease_active");
+    assert.notEqual(deferred.outputs.remote_tuple_verified, "true"); assert.ok(Date.parse(deferred.outputs.retry_at) > Date.now());
+    assert.equal(await canonicalRecord(s), null); assert.equal(s.gh.completedComments().length, 1); assert.equal(s.gh.completedComments()[0].id, commentId);
+    const deferredResult = await second.execute("exact-review-publication-result"); assert.equal(deferredResult.code, 0, deferredResult.stderr);
+    assert.equal(deferredResult.outputs.outcome, "success"); assert.equal(deferredResult.outputs.completion_kind, "retryable_failure");
+    assert.equal(deferredResult.outputs.reason_code, "review_lease_active"); assert.equal(deferredResult.outputs.retry_at, deferred.outputs.retry_at);
+    const deferredComplete = await second.execute("complete-exact-review-publication"); assert.equal(deferredComplete.code, 0, deferredComplete.stderr);
+    const completion = s.queueTrace.at(-1)!; assert.equal(completion.path, "/internal/exact-review/complete");
+    assert.equal(completion.status, 200); assert.deepEqual(completion.response, { ok: true, requeued: true });
+    assert.equal(completion.request.run_id, publisherRun); assert.equal(completion.request.run_attempt, 2);
+    assert.equal(completion.request.item_key, s.publicationKey); assert.equal(completion.request.lease_id, s.dispatch.lease_id);
+    assert.equal(completion.request.lease_revision, s.dispatch.lease_revision); assert.equal(completion.request.claim_generation, Number(claim.publisher_claim_generation));
+    assert.equal(completion.request.outcome, "success");
+    assert.equal(completion.request.completion_kind, "retryable_failure"); assert.equal(completion.request.reason_code, "review_lease_active");
+    assert.equal(completion.request.retry_at, deferred.outputs.retry_at);
+    const pending = (await s.state()).items[s.publicationKey]; assert.equal(pending.state, "pending"); assert.equal(pending.leaseId, undefined);
+    assert.ok(pending.nextAttemptAt >= Date.parse(deferred.outputs.retry_at));
+
+    // Explicit cleanup by the interrupted owner is a controlled recovery input,
+    // not an automatic candidate feature. The expiry CLI itself has no owner
+    // fence, so establish its exact original owner/id/revision before calling it.
+    const { itemSourceRevisionSha256ForTest } = await import(pathToFileURL(join(source, "dist/clawsweeper.js")).href);
+    const { freshExactHeadReviewStartLease } = await import(pathToFileURL(join(source, "dist/repair/comment-router-core.js")).href);
+    const { expireReviewStartStatusLease } = await import(pathToFileURL(join(source, "dist/clawsweeper-review-comment-state.js")).href);
+    const revision = itemSourceRevisionSha256ForTest(s.gh.item, s.gh.comments.get(number));
+    assert.equal(revision, /^item_source_revision: (.+)$/m.exec(s.report)?.[1]);
+    const leaseOptions = { comments: s.gh.comments.get(number), itemNumber: number, headSha: revision, trustedAuthors: new Set(["clawsweeper[bot]"]) };
+    const active = freshExactHeadReviewStartLease(leaseOptions); assert.ok(active);
+    assert.equal(active.owner, `github-run-${publisherRun}-1`); assert.ok(Number.isSafeInteger(active.commentId));
+    assert.equal(active.expiresAt, deferred.outputs.retry_at);
+    const leaseComment = s.gh.comments.get(number)!.find((entry) => entry.id === active.commentId); assert.ok(leaseComment);
+    assert.equal(leaseComment.user.login, "clawsweeper[bot]"); assert.ok(leaseComment.body.includes(`sha=${revision}`));
+    const bodyBefore = leaseComment.body, commentsBefore = s.gh.comments.get(number)!.map((entry) => ({ id: entry.id, body: entry.body }));
+    const queueBeforeCleanup = JSON.stringify(await s.state()), cleanupStartedAt = Date.now();
+    const cleanup = await s.command(process.execPath, ["dist/clawsweeper.js", "expire-review-lease", "--target-repo", repo, "--item-number", String(number), "--comment-id", String(active.commentId)], { GH_TOKEN: "synthetic-only-token", GITHUB_RUN_ID: publisherRun, GITHUB_RUN_ATTEMPT: "1" }, "explicit interrupted-owner lease cleanup");
+    assert.equal(cleanup.code, 0, cleanup.stderr);
+    const expiry = /\slease_expires_at=([^\s>]+)/.exec(leaseComment.body)?.[1]; assert.ok(expiry);
+    assert.ok(Date.parse(expiry) >= cleanupStartedAt && Date.parse(expiry) <= Date.now());
+    assert.equal(leaseComment.body, expireReviewStartStatusLease(bodyBefore, expiry, number)); assert.notEqual(leaseComment.body, bodyBefore);
+    assert.deepEqual(s.gh.comments.get(number)!.map((entry) => ({ id: entry.id, body: entry.body })), commentsBefore.map((entry) => entry.id === active.commentId ? { ...entry, body: expireReviewStartStatusLease(entry.body, expiry, number) } : entry));
+    assert.equal(freshExactHeadReviewStartLease(leaseOptions), null);
+    assert.equal(JSON.stringify(await s.state()), queueBeforeCleanup); assert.equal(await canonicalRecord(s), null);
+    assert.equal(s.gh.completedComments().length, 1); assert.equal(s.gh.completedComments()[0].id, commentId);
+
+    // Honor the actual Queue retry schedule and obtain a newly generated lease.
+    // Only the platform clock around alarm advances; no stored state is edited.
+    const clock = t.mock.method(Date, "now", () => Math.max(pending.nextAttemptAt, pending.updatedAt) + 1);
+    try { await s.queue.alarm(); } finally { clock.mock.restore(); }
+    const dispatched = (await s.state()).items[s.publicationKey]; assert.equal(dispatched.state, "dispatching");
+    assert.notEqual(dispatched.leaseId, s.dispatch.lease_id);
+    Object.assign(s.dispatch, { lease_id: dispatched.leaseId, lease_revision: dispatched.leaseRevision });
+    const third = scenarioRunner(s, publisher(workflow), { runId: publisherRun, runAttempt: 3 }); await third.prepare();
+    const recovered = await third.execute("publish-event-result"); assert.equal(recovered.code, 0, recovered.stderr);
     assert.equal(recovered.outputs.remote_tuple_verified, "true"); assertCommentOnly(s); assert.equal(s.gh.completedComments()[0].id, commentId);
-    const finished = await second.finish(recovered, true); assert.equal(finished.completion.request.run_attempt, 2);
+    const record = await canonicalRecord(s); assert.ok(record); assert.match(record.content, /^publication_policy: record_comment_only$/m);
+    const finished = await third.finish(recovered, true); assert.equal(finished.completion.request.run_attempt, 3);
   });
 });
